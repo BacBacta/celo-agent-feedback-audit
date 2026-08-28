@@ -38,6 +38,14 @@ export interface EvidenceVerdict {
   amount: bigint | null
   symbol: string | null
   decimals: number | null
+  /**
+   * Address of the token the amount is denominated in.
+   *
+   * Carried explicitly because an amount without its token cannot be compared
+   * to a threshold, which is the only reason to publish one — and because the
+   * attestation contract refuses the pair outright.
+   */
+  token: string | null
   claimTxHash: string | null
   claimNetwork: string | null
   declaredFrom: string | null
@@ -78,6 +86,7 @@ const EMPTY: EvidenceVerdict = {
   amount: null,
   symbol: null,
   decimals: null,
+  token: null,
   claimTxHash: null,
   claimNetwork: null,
   declaredFrom: null,
@@ -221,6 +230,7 @@ export async function checkEvidence(
     amount: check.amount,
     symbol: check.symbol,
     decimals: check.decimals,
+    token: check.token,
     transferFrom: check.from,
     transferTo: check.to,
     transferCount: check.transfers.length,

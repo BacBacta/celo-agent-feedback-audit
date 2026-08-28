@@ -226,9 +226,26 @@ export function matchParties(params: {
   }
   if (!check.exists || !check.succeeded || !check.movedValue) return none
 
+  /**
+   * A reviewer rating an agent it owns is not a customer, and money it sends
+   * itself is not a payment. Both ends match trivially in that case, so the
+   * strongest rung in the system would be available to anyone willing to spend
+   * gas transferring a stablecoin from one of their addresses to another. Self
+   * dealing is measured elsewhere in this audit and is never attribution.
+   */
+  if (agentOwner && same(reviewer, agentOwner)) {
+    return {
+      ...none,
+      note: 'reviewer owns the agent it reviewed: a self-payment is not attribution',
+    }
+  }
+
   // Any leg may carry the attribution: a routed payment can settle the agent
-  // through an intermediary while the principal leg names the router.
-  const legs = check.transfers.filter((t) => t.value > 0n)
+  // through an intermediary while the principal leg names the router. A leg
+  // that pays its own sender moves no value between parties, so it cannot
+  // carry attribution either.
+  const legs = check.transfers.filter((t) => t.value > 0n && !same(t.from, t.to))
+  const direct = legs.find((t) => same(t.from, reviewer) && (!agentOwner || same(t.to, agentOwner)))
   const payerIsReviewer = legs.some((t) => same(t.from, reviewer))
   const payeeIsAgentOwner = agentOwner ? legs.some((t) => same(t.to, agentOwner)) : false
 
@@ -268,6 +285,9 @@ export function matchParties(params: {
   )
   if (declarationHonest === false) parts.push('file declares parties the transfer contradicts')
   if (strangersOnly) parts.push('settlement touches neither the reviewer nor the agent owner')
+  // Worth recording: attribution held across two legs rather than one transfer,
+  // so the money reached the agent by a route rather than directly.
+  if (attributed && !direct) parts.push('attributed across separate legs, not one direct transfer')
 
   return { payerIsReviewer, payeeIsAgentOwner, declarationHonest, attributed, contradicted, note: parts.join('; ') }
 }

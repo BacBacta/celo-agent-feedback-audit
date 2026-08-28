@@ -574,6 +574,34 @@ check('a file whose declared parties the transfer denies is caught', () => {
   assert.equal(m.contradicted, true)
 })
 
+check('a reviewer paying an agent it owns is not attribution', () => {
+  // Otherwise the strongest rung in the system costs one self-transfer of dust:
+  // both ends match trivially when the reviewer IS the agent owner.
+  const m = matchParties({ check: settled(REVIEWER_A, REVIEWER_A), reviewer: REVIEWER_A, agentOwner: REVIEWER_A, declaredFrom: null, declaredTo: null })
+  assert.equal(m.attributed, false)
+  assert.match(m.note, /self-payment/)
+})
+
+check('a transfer to its own sender carries no attribution', () => {
+  const m = matchParties({ check: settled(AGENT_OWNER, AGENT_OWNER), reviewer: REVIEWER_A, agentOwner: AGENT_OWNER, declaredFrom: null, declaredTo: null })
+  assert.equal(m.attributed, false)
+})
+
+check('a routed payment still attributes, and says it was routed', () => {
+  // Reviewer pays an intermediary, the intermediary pays the agent: two legs,
+  // one real settlement. Refusing this would convict ordinary platform routing.
+  const routed = {
+    ...settled(REVIEWER_A, STRANGER_1),
+    transfers: [
+      { token: '0xcebA9300f2b948710d2653dD7B07f33A8B32118C' as Address, symbol: 'USDC', decimals: 6, from: REVIEWER_A as Address, to: STRANGER_1 as Address, value: 1_000_000n },
+      { token: '0xcebA9300f2b948710d2653dD7B07f33A8B32118C' as Address, symbol: 'USDC', decimals: 6, from: STRANGER_1 as Address, to: AGENT_OWNER as Address, value: 990_000n },
+    ],
+  }
+  const m = matchParties({ check: routed, reviewer: REVIEWER_A, agentOwner: AGENT_OWNER, declaredFrom: null, declaredTo: null })
+  assert.equal(m.attributed, true)
+  assert.match(m.note, /separate legs/)
+})
+
 check('a transaction that moved nothing cannot be attributed to anyone', () => {
   const dead = { ...settled(REVIEWER_A, AGENT_OWNER), movedValue: false, transfers: [] }
   const m = matchParties({ check: dead, reviewer: REVIEWER_A, agentOwner: AGENT_OWNER, declaredFrom: null, declaredTo: null })

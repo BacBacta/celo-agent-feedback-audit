@@ -1,18 +1,21 @@
 /**
- * The CSV contract shared by everything that reads this audit's exports.
+ * The CSV contract shared by the audit and the attestation service.
  *
- * This file exists in two repositories, byte for byte: here, and in the
- * attestation service that turns these rows into on-chain verdicts. A CSV whose
- * writer and reader disagree is not a format, and this one is the input to a
- * public ledger — a torn row becomes a wrong attestation nobody can retract.
+ * This file exists in two repositories and must stay byte-for-byte identical:
+ * `celo-agent-feedback-audit/src/csv.mjs` writes the rows, and
+ * `provenance-attestations/script/csv.mjs` reads them before turning them into
+ * on-chain verdicts. A CSV whose writer and reader disagree is not a format,
+ * and this one is the input to a public ledger — a torn row becomes a wrong
+ * attestation nobody can retract. The attestation service's test suite compares
+ * the two copies and fails if they drift.
  *
- * The writer (`src/main.ts`) guarantees one record per physical line by
- * escaping control characters rather than quoting them, because `feedbackURI`
- * is attacker-controlled and a literal newline inside a quoted field would let
- * one review forge a second row. The reader below is nonetheless a full
- * RFC 4180 state machine that handles embedded newlines correctly: the format
- * promises the stronger property, and the parser refuses to be the weak link if
- * some other producer ever breaks that promise.
+ * The writer guarantees one record per physical line by escaping control
+ * characters rather than quoting them, because `feedbackURI` is
+ * attacker-controlled and a literal newline inside a quoted field would let one
+ * review forge a second row. The reader below is nonetheless a full RFC 4180
+ * state machine that handles embedded newlines correctly: the format promises
+ * the stronger property, and the parser refuses to be the weak link if some
+ * other producer ever breaks that promise.
  */
 
 /**
