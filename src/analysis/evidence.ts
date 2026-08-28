@@ -7,6 +7,8 @@ export interface EvidenceVerdict {
   hasPointer: boolean
   /** The file was retrievable. */
   fetched: boolean
+  /** The retrieved content parsed as JSON — an HTML soft-404 fails this. */
+  jsonValid: boolean
   /** keccak256(file) matched the on-chain feedbackHash — this is the attested file. */
   hashMatches: boolean
   /** The file contains a payment claim, in any of the shapes seen in the wild. */
@@ -27,6 +29,7 @@ export interface EvidenceVerdict {
 const EMPTY: EvidenceVerdict = {
   hasPointer: false,
   fetched: false,
+  jsonValid: false,
   hashMatches: false,
   claimsPayment: false,
   shape: null,
@@ -83,12 +86,15 @@ export async function checkEvidence(
   try {
     parsed = JSON.parse(text)
   } catch {
-    return { ...EMPTY, hasPointer: true, fetched: true, hashMatches, note: 'not JSON' }
+    // A dead file behind a CDN often comes back as an HTML error page with
+    // HTTP 200. That is not "evidence that fails its hash" — it is evidence
+    // that is gone. jsonValid carries the distinction to the ladder.
+    return { ...EMPTY, hasPointer: true, fetched: true, jsonValid: false, hashMatches, note: 'not JSON' }
   }
 
   const claim = extractPaymentClaim(parsed)
   if (!claim.txHash) {
-    return { ...EMPTY, hasPointer: true, fetched: true, hashMatches, note: 'no payment claim' }
+    return { ...EMPTY, hasPointer: true, fetched: true, jsonValid: true, hashMatches, note: 'no payment claim' }
   }
 
   const check = await verifyPaymentTx(claim.txHash)
@@ -96,6 +102,7 @@ export async function checkEvidence(
   return {
     hasPointer: true,
     fetched: true,
+    jsonValid: true,
     hashMatches,
     claimsPayment: true,
     shape: claim.shape,

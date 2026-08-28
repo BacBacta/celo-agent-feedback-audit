@@ -9,7 +9,7 @@ import { loadSettlementsFrom } from './sources/settlements.js'
 import { checkEvidence, type EvidenceVerdict } from './analysis/evidence.js'
 import { concentration, findBursts } from './analysis/concentration.js'
 import { reconcile, summarize } from './analysis/reconcile.js'
-import { renderMarkdown, renderJSON, collectEvidence, type AuditResult } from './report.js'
+import { renderMarkdown, renderJSON, collectEvidence, rung, type AuditResult } from './report.js'
 
 const iso = (ts: number) => (ts ? new Date(ts * 1000).toISOString().slice(0, 10) : 'unknown')
 
@@ -140,10 +140,61 @@ async function main() {
    * the platform whose pipeline produced them — check that claim hash by hash
    * instead of taking the aggregate on faith.
    */
+  // Index verdicts by record so both exports below can look them up.
+  const verdictByRecord = new Map<(typeof toCheck)[number], (typeof verdicts)[number]>()
+  toCheck.forEach((rec, i) => { if (verdicts[i]) verdictByRecord.set(rec, verdicts[i]!) })
+
   const claimRows = toCheck
-    .map((rec, i) => ({ rec, v: verdicts[i] }))
+    .map((rec) => ({ rec, v: verdictByRecord.get(rec) }))
     .filter((x) => x.v?.claimsPayment)
   const csvEsc = (val: unknown) => `"${String(val ?? '').replace(/"/g, '""')}"`
+
+  /**
+   * Every record whose evidence was actually checked, with the rung it reached.
+   *
+   * The narrower claims file below covers only records that declare a payment —
+   * 93 of 27,520. That is a third of a percent of the registry, and attesting
+   * only those would leave the far more common failures (a file that no longer
+   * resolves, a hash attested with no file at all) unrecorded. This file is the
+   * full ladder, and it is what the attestation backfill consumes.
+   */
+  const evidenceRows = [
+    // Records whose declared file was actually fetched and judged.
+    ...feedback.filter((r) => verdictByRecord.has(r)).map((rec) => ({ rec, v: verdictByRecord.get(rec)! })),
+    // Records that attested a hash while declaring no file: identifiable from
+    // the event alone, no fetch needed, and a third of the registry. Records
+    // declaring neither URI nor hash are left unattested — there is no
+    // evidence claim to verify, and the ledger's None default says exactly that.
+    ...feedback.filter((r) => !r.hasURI && r.hasHash).map((rec) => ({ rec, v: undefined })),
+  ]
+  writeFileSync(
+    'out/evidence.csv',
+    [
+      'timestamp,block,agentId,reviewer,rung,hasURI,fetched,jsonValid,hashMatched,claimsPayment,txExistsOnCelo,paymentVerified,claimTxHash,evidenceHash,note,feedbackURI',
+      ...evidenceRows.map(({ rec, v }) =>
+        [
+          new Date(rec.timestamp * 1000).toISOString(),
+          rec.blockNumber,
+          rec.agentId,
+          rec.reviewer,
+          v ? rung(rec, v) : 'EvidenceAbsent',
+          rec.hasURI,
+          v?.fetched ?? false,
+          v?.jsonValid ?? false,
+          v?.hashMatches ?? false,
+          v?.claimsPayment ?? false,
+          v?.txExists ?? false,
+          v?.paymentVerified ?? false,
+          v?.claimTxHash ?? '',
+          rec.feedbackHash,
+          v?.note ?? '',
+          rec.feedbackURI,
+        ]
+          .map(csvEsc)
+          .join(','),
+      ),
+    ].join('\n'),
+  )
   writeFileSync(
     'out/claims.csv',
     [
@@ -158,7 +209,7 @@ async function main() {
           v!.claimTxHash,
           v!.txExists,
           v!.paymentVerified,
-          v!.note ?? '',
+          v?.note ?? '',
           rec.feedbackURI,
         ]
           .map(csvEsc)
@@ -202,7 +253,11 @@ async function main() {
   }
   console.log(`  written by Self ID holder   ${stats.humanBacked}`)
   console.log('─'.repeat(60))
-  console.log(`\nWrote out/audit.md, out/audit.json, out/samples.json and out/claims.csv (${claimRows.length} claims)`)
+  console.log(
+    `\nWrote out/audit.md, out/audit.json, out/samples.json,\n` +
+      `      out/claims.csv (${claimRows.length} payment claims) and\n` +
+      `      out/evidence.csv (${evidenceRows.length} checked records — the full ladder)`,
+  )
 }
 
 main().catch((e) => {

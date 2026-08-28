@@ -155,3 +155,31 @@ export function collectEvidence(verdicts: EvidenceVerdict[], sampled: number) {
     sampled,
   }
 }
+
+/**
+ * The rung a record's evidence reached, named identically to the on-chain
+ * Verdict enum so the audit and the attestation ledger cannot drift apart.
+ *
+ * Three distinctions this ladder owes to its own counter-analysis:
+ * a soft-404 (HTML served with HTTP 200) is a DEAD file, not a mismatched one;
+ * a live file with a zero attested hash is UNBOUND, not mismatched — there was
+ * never anything to contradict; and a mismatch only means something when a
+ * real hash was attested and real JSON came back.
+ */
+export function rung(
+  rec: { hasURI: boolean; hasHash: boolean },
+  v: { fetched: boolean; jsonValid: boolean; hashMatches: boolean; claimsPayment: boolean; txExists: boolean; paymentVerified: boolean; note?: string },
+): string {
+  if (v.paymentVerified) return 'PaymentVerified'
+  if (v.claimsPayment && !v.txExists) return 'PaymentTxNotFound'
+  if (v.claimsPayment && v.txExists) {
+    const note = (v.note ?? '').toLowerCase()
+    return note.includes('zero') || note.includes('no stablecoin') ? 'PaymentNoValue' : 'PaymentTxFailed'
+  }
+  if (v.fetched && v.jsonValid) {
+    if (!rec.hasHash) return 'EvidenceUnbound'
+    return v.hashMatches ? 'EvidenceIntact' : 'EvidenceUnhashed'
+  }
+  if (rec.hasURI) return 'EvidenceUnreachable'
+  return 'EvidenceAbsent'
+}

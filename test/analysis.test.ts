@@ -368,3 +368,53 @@ import('../src/rpc.js').then(({ dedupeLogs }) => {
 
   console.log(`\n${passed} passed (async suite)\n`)
 })
+
+console.log('\nevidence ladder mapping')
+
+import('../src/report.js').then(({ rung }) => {
+  const rec = (hasURI: boolean, hasHash = true) => ({ hasURI, hasHash })
+  const v = (o: Partial<{ fetched: boolean; jsonValid: boolean; hashMatches: boolean; claimsPayment: boolean; txExists: boolean; paymentVerified: boolean; note: string }>) => ({
+    fetched: false, jsonValid: false, hashMatches: false, claimsPayment: false, txExists: false, paymentVerified: false, ...o,
+  })
+
+  check('a verified payment is the top rung', () => {
+    assert.equal(rung(rec(true), v({ fetched: true, claimsPayment: true, txExists: true, paymentVerified: true })), 'PaymentVerified')
+  })
+
+  check('a declared payment that is not on chain is named as such', () => {
+    assert.equal(rung(rec(true), v({ fetched: true, claimsPayment: true, txExists: false })), 'PaymentTxNotFound')
+  })
+
+  check('a zero-value settlement is distinguished from a failed one', () => {
+    assert.equal(rung(rec(true), v({ fetched: true, claimsPayment: true, txExists: true, note: 'transfer of zero' })), 'PaymentNoValue')
+    assert.equal(rung(rec(true), v({ fetched: true, claimsPayment: true, txExists: true, note: 'reverted' })), 'PaymentTxFailed')
+  })
+
+  check('a file that resolves and hash-matches without a payment is intact, not a failure', () => {
+    assert.equal(rung(rec(true), v({ fetched: true, jsonValid: true, hashMatches: true })), 'EvidenceIntact')
+  })
+
+  check('a real mismatch requires a real hash and real JSON', () => {
+    assert.equal(rung(rec(true), v({ fetched: true, jsonValid: true, hashMatches: false })), 'EvidenceUnhashed')
+  })
+
+  check('a soft-404 — HTML behind HTTP 200 — is a dead file, not a mismatched one', () => {
+    // The bug this ladder revision exists for: 1,582 of 2,055 "mismatches"
+    // were CDN error pages counted as altered evidence.
+    assert.equal(rung(rec(true), v({ fetched: true, jsonValid: false, note: 'not JSON' })), 'EvidenceUnreachable')
+  })
+
+  check('a live valid file with no attested hash is unbound, not mismatched', () => {
+    assert.equal(rung(rec(true, false), v({ fetched: true, jsonValid: true })), 'EvidenceUnbound')
+  })
+
+  check('a declared file that no longer resolves is unreachable', () => {
+    assert.equal(rung(rec(true), v({})), 'EvidenceUnreachable')
+  })
+
+  check('a hash attested with no file at all is the bottom rung', () => {
+    assert.equal(rung(rec(false), v({})), 'EvidenceAbsent')
+  })
+
+  console.log(`\n${passed} passed (with ladder)\n`)
+})
