@@ -31,6 +31,12 @@ here are deliberately the same ones, so the results are directly comparable.
   attested on-chain, and contain a `proofOfPayment` that resolves to a real
   settled transfer. Each step is reported separately, because the interesting
   result is *where* the chain of evidence breaks.
+- **Payment attribution** — whether a settled payment was made *by this reviewer
+  to this agent*, which is a strictly stronger fact than the payment merely
+  existing. Anyone can cite any real transfer on the chain, so "verified" is a
+  floor and only "attributed" is a filter. Settlements whose parties contradict
+  the file that names them are reported separately again, as accusations rather
+  than as confirmations.
 - **Reconstructed payment backing** — for every review, whether a stablecoin
   settlement from the reviewer to the agent's owner exists, and whether it
   landed *before* the review. Payments arriving afterwards are counted
@@ -68,6 +74,71 @@ free public RPC.
 npm test         # analysis unit tests, no network needed (needs tsx)
 npm run typecheck
 ```
+
+## Checking the audit's own answers
+
+Three of the objections this tool's counter-analysis raised are answerable from
+the export alone, with no network and no key:
+
+```bash
+npm run counter-checks    # reads out/evidence.csv
+```
+
+It decomposes the negative verdicts by cause — separating files a host called
+gone from files this audit merely failed to reach — counts how many reviews
+lean on the same payment transaction, and lists which networks the unfound
+payments actually name. It exits non-zero when a payment underwrites more than
+one review.
+
+```bash
+npm run verify-parties    # needs an RPC
+```
+
+Re-reads every verified payment from a node, re-derives the agent's owner from
+the Identity Registry, and prints who actually paid whom. Exits non-zero if a
+published `PaymentVerified` turns out to be a settlement between parties
+unrelated to the review.
+
+```bash
+CROSSCHECK_RPC=https://a-different-provider npm run crosscheck
+```
+
+Recounts the indexed events against a **second provider**. Without
+`CROSSCHECK_RPC` set to a different endpoint it re-asks the audit's own node and
+says so: agreement with yourself is not corroboration, and the script prints the
+independence it actually achieved before printing any number.
+
+## What a negative verdict does and does not mean
+
+A file this audit could not retrieve is not the same as a file that is gone, and
+the distinction is the difference between a finding and a failure to measure:
+
+| Outcome | Meaning | Is it a finding? |
+|---|---|---|
+| `EvidenceUnreachable` | a host answered 404/410 — it asserts the file is absent | yes |
+| `EvidenceInconclusive` | rate limit, timeout, every gateway busy, or beyond the sampling cap | **no** |
+| `EvidenceUnhashed` | the file resolved and does not match its attested digest | yes, but see below |
+
+`EvidenceUnhashed` says the bytes served today do not hash to what was attested.
+It does **not** date the divergence and does not prove tampering: a publisher who
+hashed with sha256, or whose server re-serialises the JSON or adds a BOM, fails
+the check from the first day. The export therefore carries `contentSha256`
+alongside the keccak digest, so a publisher can see which of the two their file
+actually matches.
+
+Evidence retrieval is bounded and re-tried rather than taken on one attempt:
+each URI is tried across independent IPFS/Arweave gateways, twice, with the
+deadline covering the body and not just the response headers. Responses are
+capped at 1 MB (`EVIDENCE_MAX_BYTES`) and any URI resolving into private address
+space is refused unfetched — `feedbackURI` is written by the party being
+audited, and is treated as hostile input throughout.
+
+## The evidence corpus
+
+Every file the audit actually reads is stored under `out/evidence-corpus/`,
+keyed by the keccak-256 of its bytes, with a manifest recording which URI served
+it and when. Without it the audit's verdicts decay into the thing they accuse:
+an assertion whose proof is a dead link. Set `ARCHIVE_EVIDENCE=0` to skip it.
 
 ## Choosing an RPC source — read this before a full-history run
 

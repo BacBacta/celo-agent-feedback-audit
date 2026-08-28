@@ -21,6 +21,11 @@ export interface AuditResult {
     claimsPayment: number
     txExists: number
     paymentVerified: number
+    paymentAttributed: number
+    partyMismatch: number
+    foreignChain: number
+    inconclusive: number
+    archivedFiles: number
     sampled: number
     sampleStride: number
   }
@@ -53,6 +58,7 @@ export function renderMarkdown(r: AuditResult): string {
 | …claiming a specific payment transaction | ${num(r.evidence.claimsPayment)} (${pct(r.evidence.claimsPayment, t)}) |
 | …whose claimed transaction exists on chain | ${num(r.evidence.txExists)} (${pct(r.evidence.txExists, t)}) |
 | …whose payment actually verifies | **${num(r.evidence.paymentVerified)} (${pct(r.evidence.paymentVerified, t)})** |
+| …whose payment is also *attributable* to this reviewer and agent | **${num(r.evidence.paymentAttributed)} (${pct(r.evidence.paymentAttributed, t)})** |
 | …where the reviewer demonstrably paid the agent | **${num(r.reconciliation.backed)} (${pct(r.reconciliation.backed, t)})** |
 | …written by a Self Agent ID holder | **${num(r.reconciliation.humanBacked)} (${pct(r.reconciliation.humanBacked, t)})** |
 | Stablecoin settlements observed between these parties | ${num(r.settlementsSeen)} |
@@ -81,6 +87,17 @@ chain breaks.
 | Contains a payment claim | ${num(r.evidence.claimsPayment)} | ${pct(r.evidence.claimsPayment, t)} |
 | Claimed transaction exists on chain | ${num(r.evidence.txExists)} | ${pct(r.evidence.txExists, t)} |
 | Payment verified — exists, succeeded, moved value | **${num(r.evidence.paymentVerified)}** | **${pct(r.evidence.paymentVerified, t)}** |
+| Payment attributed — …and paid by this reviewer to this agent | **${num(r.evidence.paymentAttributed)}** | **${pct(r.evidence.paymentAttributed, t)}** |
+| Payment cited but its parties contradict the claim | ${num(r.evidence.partyMismatch)} | ${pct(r.evidence.partyMismatch, t)} |
+| Payment declared on a chain this audit does not query | ${num(r.evidence.foreignChain)} | ${pct(r.evidence.foreignChain, t)} |
+
+> **Not a finding:** ${num(r.evidence.inconclusive)} records could not be retrieved for
+> reasons that prove nothing — rate limits, timeouts, gateway outages. They are
+> excluded from the dead-link count above rather than folded into it. A file
+> this audit failed to reach is a question it failed to ask, not an answer.
+> ${num(r.evidence.archivedFiles)} retrieved files were archived content-addressed under
+> \`out/evidence-corpus/\`, so every verdict above stays checkable after the
+> originals go offline.
 
 ${
   r.evidence.sampled < r.evidence.declaresURI
@@ -133,6 +150,17 @@ not labelled fraudulent.
 - Correlation is not endorsement: a payment before a review does not prove the
   review is honest. It proves only that something was at stake, which is exactly
   what is missing today.
+- **Verified is not attributed.** \`PaymentVerified\` says a cited transaction
+  settled; it does not say the payer was the reviewer or the payee the agent.
+  Anyone may cite any real transfer, so that rung is a floor, not a filter. Only
+  \`PaymentAttributed\` — both ends confirmed — carries the strong claim, and
+  only \`PaymentPartyMismatch\` is an accusation.
+- A payment is attributed against the agent's *registered NFT owner*. An agent
+  paid at an operator address it controls but does not hold the token for reads
+  as unattributed, so the attributed count is a **lower bound**.
+- Amounts are reported unthresholded. A verified settlement of one millionth of
+  a dollar and one of five hundred dollars reach the same rung; the amount is
+  published alongside so a consumer can set its own floor.
 `
 }
 
@@ -152,6 +180,14 @@ export function collectEvidence(verdicts: EvidenceVerdict[], sampled: number) {
     claimsPayment: verdicts.filter((v) => v.claimsPayment).length,
     txExists: verdicts.filter((v) => v.txExists).length,
     paymentVerified: verdicts.filter((v) => v.paymentVerified).length,
+    paymentAttributed: verdicts.filter((v) => v.paymentAttributed).length,
+    partyMismatch: verdicts.filter((v) => v.partiesContradicted).length,
+    foreignChain: verdicts.filter((v) => v.claimsPayment && !v.onQueryableChain).length,
+    // Counted apart from `fetched` on purpose: these are the records the audit
+    // failed to reach, not the records it found dead. Reporting them inside the
+    // dead-link figure is how a transport problem becomes a published finding.
+    inconclusive: verdicts.filter((v) => v.inconclusive).length,
+    archivedFiles: verdicts.filter((v) => v.contentId !== null).length,
     sampled,
   }
 }
@@ -160,26 +196,106 @@ export function collectEvidence(verdicts: EvidenceVerdict[], sampled: number) {
  * The rung a record's evidence reached, named identically to the on-chain
  * Verdict enum so the audit and the attestation ledger cannot drift apart.
  *
- * Three distinctions this ladder owes to its own counter-analysis:
+ * Six distinctions this ladder owes to its own counter-analysis:
  * a soft-404 (HTML served with HTTP 200) is a DEAD file, not a mismatched one;
  * a live file with a zero attested hash is UNBOUND, not mismatched — there was
- * never anything to contradict; and a mismatch only means something when a
- * real hash was attested and real JSON came back.
+ * never anything to contradict; a mismatch only means something when a real
+ * hash was attested and real JSON came back; a settlement whose parties are the
+ * reviewer and the agent is a strictly stronger fact than one that merely
+ * exists; a payment declared on a chain we never queried is not a payment we
+ * found missing; and a retrieval that was rate-limited or timed out is not a
+ * dead link, it is a question we failed to ask.
+ *
+ * The last three add rungs rather than redefining old ones. Enum values are
+ * append-only — 20,097 verdicts are already published under the first nine, and
+ * silently changing what one of them means would corrupt every indexer reading
+ * them.
  */
 export function rung(
   rec: { hasURI: boolean; hasHash: boolean },
-  v: { fetched: boolean; jsonValid: boolean; hashMatches: boolean; claimsPayment: boolean; txExists: boolean; paymentVerified: boolean; note?: string },
+  v: {
+    fetched: boolean
+    jsonValid: boolean
+    hashMatches: boolean
+    claimsPayment: boolean
+    txExists: boolean
+    paymentVerified: boolean
+    paymentAttributed?: boolean
+    partiesContradicted?: boolean
+    onQueryableChain?: boolean
+    inconclusive?: boolean
+    note?: string
+  },
 ): string {
+  // Payment rungs, strongest first.
+  if (v.paymentVerified && v.paymentAttributed) return 'PaymentAttributed'
+  if (v.paymentVerified && v.partiesContradicted) return 'PaymentPartyMismatch'
   if (v.paymentVerified) return 'PaymentVerified'
+  if (v.claimsPayment && v.onQueryableChain === false) return 'PaymentForeignChain'
   if (v.claimsPayment && !v.txExists) return 'PaymentTxNotFound'
   if (v.claimsPayment && v.txExists) {
     const note = (v.note ?? '').toLowerCase()
     return note.includes('zero') || note.includes('no stablecoin') ? 'PaymentNoValue' : 'PaymentTxFailed'
   }
+  // Documentary rungs.
   if (v.fetched && v.jsonValid) {
     if (!rec.hasHash) return 'EvidenceUnbound'
     return v.hashMatches ? 'EvidenceIntact' : 'EvidenceUnhashed'
   }
+  // An unanswered question outranks a wrong answer: this record is not a
+  // finding, and must never be counted as a dead link.
+  if (v.inconclusive) return 'EvidenceInconclusive'
   if (rec.hasURI) return 'EvidenceUnreachable'
   return 'EvidenceAbsent'
 }
+
+/**
+ * The documentary dimension, recorded independently of the payment one.
+ *
+ * A single verdict slot cannot carry both: the payment rungs outrank every
+ * documentary rung, so for the 93 records that declare a payment the state of
+ * their file was measured and then thrown away. Reporting the two side by side
+ * is what lets a consumer ask "settled AND intact" instead of guessing which
+ * question the one verdict answered.
+ */
+export function evidenceRung(
+  rec: { hasURI: boolean; hasHash: boolean },
+  v: { fetched: boolean; jsonValid: boolean; hashMatches: boolean; inconclusive?: boolean },
+): string {
+  if (v.fetched && v.jsonValid) {
+    if (!rec.hasHash) return 'Unbound'
+    return v.hashMatches ? 'Intact' : 'Unhashed'
+  }
+  if (v.inconclusive) return 'Inconclusive'
+  if (rec.hasURI) return 'Unreachable'
+  return 'Absent'
+}
+
+/** Every rung name, in on-chain enum order. Index === the contract's value. */
+export const RUNG_ORDER = [
+  'None',
+  'PaymentVerified',
+  'EvidenceIntact',
+  'EvidenceUnbound',
+  'EvidenceUnhashed',
+  'PaymentTxNotFound',
+  'PaymentTxFailed',
+  'PaymentNoValue',
+  'EvidenceUnreachable',
+  'EvidenceAbsent',
+  'PaymentAttributed',
+  'PaymentPartyMismatch',
+  'PaymentForeignChain',
+  'EvidenceInconclusive',
+] as const
+
+/** Evidence-dimension names, in on-chain enum order. */
+export const EVIDENCE_ORDER = [
+  'Unknown',
+  'Intact',
+  'Unbound',
+  'Unhashed',
+  'Unreachable',
+  'Inconclusive',
+  'Absent',
+] as const

@@ -371,7 +371,7 @@ import('../src/rpc.js').then(({ dedupeLogs }) => {
 
 console.log('\nevidence ladder mapping')
 
-import('../src/report.js').then(({ rung }) => {
+import('../src/report.js').then(({ rung, evidenceRung, RUNG_ORDER }) => {
   const rec = (hasURI: boolean, hasHash = true) => ({ hasURI, hasHash })
   const v = (o: Partial<{ fetched: boolean; jsonValid: boolean; hashMatches: boolean; claimsPayment: boolean; txExists: boolean; paymentVerified: boolean; note: string }>) => ({
     fetched: false, jsonValid: false, hashMatches: false, claimsPayment: false, txExists: false, paymentVerified: false, ...o,
@@ -416,5 +416,201 @@ import('../src/report.js').then(({ rung }) => {
     assert.equal(rung(rec(false), v({})), 'EvidenceAbsent')
   })
 
+  check('an attributed settlement outranks a merely verified one', () => {
+    assert.equal(
+      rung(rec(true), v({ fetched: true, jsonValid: true, claimsPayment: true, txExists: true, paymentVerified: true, paymentAttributed: true })),
+      'PaymentAttributed',
+    )
+  })
+
+  check('a settlement whose parties contradict the claim is demoted, not promoted', () => {
+    assert.equal(
+      rung(rec(true), v({ fetched: true, jsonValid: true, claimsPayment: true, txExists: true, paymentVerified: true, partiesContradicted: true })),
+      'PaymentPartyMismatch',
+    )
+  })
+
+  check('a payment declared on another chain is not reported as missing from this one', () => {
+    // "Not found on Celo" about a Base transaction is a finding we never made.
+    assert.equal(
+      rung(rec(true), v({ fetched: true, jsonValid: true, claimsPayment: true, txExists: false, onQueryableChain: false })),
+      'PaymentForeignChain',
+    )
+  })
+
+  check('a retrieval that was rate-limited is inconclusive, never a dead link', () => {
+    assert.equal(rung(rec(true), v({ inconclusive: true })), 'EvidenceInconclusive')
+  })
+
+  check('inconclusive never outranks a file we actually read', () => {
+    assert.equal(
+      rung(rec(true), v({ fetched: true, jsonValid: true, hashMatches: true, inconclusive: false })),
+      'EvidenceIntact',
+    )
+  })
+
+  check('the evidence dimension survives a payment verdict that would mask it', () => {
+    // The whole point of the second column: a record whose headline is a
+    // payment still records whether its file was intact.
+    const withPayment = v({ fetched: true, jsonValid: true, hashMatches: true, claimsPayment: true, txExists: true, paymentVerified: true, paymentAttributed: true })
+    assert.equal(rung(rec(true), withPayment), 'PaymentAttributed')
+    assert.equal(evidenceRung(rec(true), withPayment), 'Intact')
+  })
+
+  check('every rung name has an on-chain enum slot, and the order is append-only', () => {
+    for (const name of ['PaymentAttributed', 'PaymentPartyMismatch', 'PaymentForeignChain', 'EvidenceInconclusive']) {
+      assert.ok(RUNG_ORDER.includes(name as never), `${name} missing from RUNG_ORDER`)
+    }
+    // The first ten values are already published on chain under these names.
+    assert.deepEqual(RUNG_ORDER.slice(0, 10), [
+      'None', 'PaymentVerified', 'EvidenceIntact', 'EvidenceUnbound', 'EvidenceUnhashed',
+      'PaymentTxNotFound', 'PaymentTxFailed', 'PaymentNoValue', 'EvidenceUnreachable', 'EvidenceAbsent',
+    ])
+  })
+
   console.log(`\n${passed} passed (with ladder)\n`)
 })
+
+// ---------------------------------------------------------------------------
+
+console.log('\nSSRF guard')
+
+const { isPrivateAddress, resolveTargets } = await import('../src/net/fetch-evidence.js')
+
+check('loopback, link-local and RFC1918 space are refused', () => {
+  for (const ip of ['127.0.0.1', '10.0.0.5', '192.168.1.1', '172.16.0.1', '172.31.255.255',
+                    '169.254.169.254', '0.0.0.0', '100.64.0.1', '::1', 'fe80::1', 'fd00::1',
+                    '::ffff:127.0.0.1']) {
+    assert.equal(isPrivateAddress(ip), true, `${ip} should be refused`)
+  }
+})
+
+check('ordinary public addresses are allowed through', () => {
+  for (const ip of ['1.1.1.1', '8.8.8.8', '172.32.0.1', '192.169.0.1', '2606:4700::1']) {
+    assert.equal(isPrivateAddress(ip), false, `${ip} should be allowed`)
+  }
+})
+
+check('the cloud metadata endpoint is refused specifically', () => {
+  // The single most valuable SSRF target on any hosted runner.
+  assert.equal(isPrivateAddress('169.254.169.254'), true)
+})
+
+console.log('\nURI resolution')
+
+check('a content-addressed URI fans out across independent gateways', () => {
+  const { targets, scheme } = resolveTargets('ipfs://bafyfake')
+  assert.equal(scheme, 'ipfs')
+  assert.ok(targets.length > 1, 'one gateway is not a measurement')
+  assert.ok(targets.every((t) => t.endsWith('bafyfake')))
+})
+
+check('scheme comparison is case-insensitive', () => {
+  // `HTTPS://` and `IPFS://` are valid and were previously called unresolvable.
+  assert.equal(resolveTargets('HTTPS://example.test/a.json').scheme, 'http')
+  assert.equal(resolveTargets('IPFS://bafyfake').scheme, 'ipfs')
+})
+
+check('Arweave and data URIs resolve instead of being written off', () => {
+  assert.equal(resolveTargets('ar://abc').scheme, 'ar')
+  assert.ok(resolveTargets('ar://abc').targets.length >= 1)
+  assert.equal(resolveTargets('data:application/json,{}').scheme, 'data')
+})
+
+check('a scheme with no transport is named, not silently dropped', () => {
+  const { targets, scheme } = resolveTargets('magnet:?xt=urn:btih:abc')
+  assert.equal(targets.length, 0)
+  assert.equal(scheme, 'magnet')
+})
+
+console.log('\npayment attribution')
+
+const { matchParties, isQueryableNetwork } = await import('../src/analysis/payment.js')
+
+const REVIEWER_A = '0xaaaa000000000000000000000000000000000001'
+const AGENT_OWNER = '0xbbbb000000000000000000000000000000000002'
+const STRANGER_1 = '0xcccc000000000000000000000000000000000003'
+const STRANGER_2 = '0xdddd000000000000000000000000000000000004'
+
+const settled = (from: string, to: string) => ({
+  exists: true, succeeded: true, movedValue: true,
+  amount: 1_000_000n, symbol: 'USDC', decimals: 6,
+  token: '0xcebA9300f2b948710d2653dD7B07f33A8B32118C' as Address,
+  from: from as Address, to: to as Address,
+  transfers: [{ token: '0xcebA9300f2b948710d2653dD7B07f33A8B32118C' as Address, symbol: 'USDC', decimals: 6, from: from as Address, to: to as Address, value: 1_000_000n }],
+  onQueryableChain: true,
+})
+
+check('a settlement from the reviewer to the agent owner is attributed', () => {
+  const m = matchParties({ check: settled(REVIEWER_A, AGENT_OWNER), reviewer: REVIEWER_A, agentOwner: AGENT_OWNER, declaredFrom: null, declaredTo: null })
+  assert.equal(m.attributed, true)
+  assert.equal(m.contradicted, false)
+})
+
+check('citing a transfer between two strangers is a contradiction, not a verification', () => {
+  // The §3.1 attack in its pure form: point at any real payment on the chain.
+  const m = matchParties({ check: settled(STRANGER_1, STRANGER_2), reviewer: REVIEWER_A, agentOwner: AGENT_OWNER, declaredFrom: null, declaredTo: null })
+  assert.equal(m.attributed, false)
+  assert.equal(m.contradicted, true)
+})
+
+check('a platform paying on the reviewer\'s behalf is unattributed, never accused', () => {
+  // Legitimate and common: the payer is the platform treasury, the payee is
+  // still the agent. Convicting this would convict the honest majority.
+  const m = matchParties({ check: settled(STRANGER_1, AGENT_OWNER), reviewer: REVIEWER_A, agentOwner: AGENT_OWNER, declaredFrom: null, declaredTo: null })
+  assert.equal(m.attributed, false)
+  assert.equal(m.contradicted, false)
+})
+
+check('an unknown agent owner yields ignorance, not attribution and not accusation', () => {
+  const m = matchParties({ check: settled(REVIEWER_A, STRANGER_2), reviewer: REVIEWER_A, agentOwner: null, declaredFrom: null, declaredTo: null })
+  assert.equal(m.attributed, false)
+  assert.equal(m.contradicted, false)
+})
+
+check('a file whose declared parties the transfer denies is caught', () => {
+  const m = matchParties({ check: settled(REVIEWER_A, AGENT_OWNER), reviewer: REVIEWER_A, agentOwner: AGENT_OWNER, declaredFrom: STRANGER_1, declaredTo: null })
+  assert.equal(m.declarationHonest, false)
+  assert.equal(m.contradicted, true)
+})
+
+check('a transaction that moved nothing cannot be attributed to anyone', () => {
+  const dead = { ...settled(REVIEWER_A, AGENT_OWNER), movedValue: false, transfers: [] }
+  const m = matchParties({ check: dead, reviewer: REVIEWER_A, agentOwner: AGENT_OWNER, declaredFrom: null, declaredTo: null })
+  assert.equal(m.attributed, false)
+  assert.equal(m.contradicted, false)
+})
+
+check('only chains this audit queries may produce a "not found" finding', () => {
+  assert.equal(isQueryableNetwork('42220'), true)
+  assert.equal(isQueryableNetwork('celo'), true)
+  assert.equal(isQueryableNetwork(null), true)
+  assert.equal(isQueryableNetwork('8453'), false)
+  assert.equal(isQueryableNetwork('base'), false)
+})
+
+console.log('\nhostile evidence files')
+
+const { extractPaymentClaim: extract2 } = await import('../src/analysis/payment.js')
+
+check('a file that is literally `null` is handled, not fatal', () => {
+  // `JSON.parse("null")` does not throw — it returns null, and reading a
+  // property off it used to end the entire audit from four bytes.
+  assert.doesNotThrow(() => extract2(null))
+  assert.equal(extract2(null).txHash, null)
+})
+
+check('primitives and arrays are rejected as documents', () => {
+  for (const bad of [7, 'text', true, [1, 2, 3]]) {
+    assert.doesNotThrow(() => extract2(bad as never))
+    assert.equal(extract2(bad as never).txHash, null)
+  }
+})
+
+check('a claim nested under a null proof object does not throw', () => {
+  assert.equal(extract2({ proofOfPayment: null }).txHash, null)
+  assert.equal(extract2({ proofOfPayment: 'a string' }).txHash, null)
+  assert.equal(extract2({ transactions: 42 }).txHash, null)
+})
+
+console.log(`\n${passed} passed (full suite)\n`)

@@ -7,9 +7,14 @@ import { loadFeedback } from './sources/feedback.js'
 import { loadIdentity, loadSelfVerified } from './sources/identity.js'
 import { loadSettlementsFrom } from './sources/settlements.js'
 import { checkEvidence, type EvidenceVerdict } from './analysis/evidence.js'
+import { EvidenceArchive } from './archive.js'
+// One escaper, shared with the offline tooling and with the attestation
+// service that consumes these rows. Two implementations of one format drift,
+// and this format's consumer writes to a public ledger.
+import { escapeCell as csvEsc } from './csv.mjs'
 import { concentration, findBursts } from './analysis/concentration.js'
 import { reconcile, summarize } from './analysis/reconcile.js'
-import { renderMarkdown, renderJSON, collectEvidence, rung, type AuditResult } from './report.js'
+import { renderMarkdown, renderJSON, collectEvidence, rung, evidenceRung, type AuditResult } from './report.js'
 
 const iso = (ts: number) => (ts ? new Date(ts * 1000).toISOString().slice(0, 10) : 'unknown')
 
@@ -91,14 +96,53 @@ async function main() {
       (stride > 1 ? ` (every ${stride}th, spread across the full period)` : ' (all of them)'),
   )
 
-  const verdicts: EvidenceVerdict[] = []
+  /**
+   * Retrieved bytes are kept, content-addressed, beside the verdicts they
+   * justify. An audit that convicts a file and does not keep it has published
+   * exactly what it condemns: a claim whose evidence is a dead link.
+   */
+  const archive = process.env.ARCHIVE_EVIDENCE === '0' ? null : new EvidenceArchive('out/evidence-corpus')
+
+  /**
+   * Verdicts are paired with their record as they are produced. A positional
+   * zip afterwards would silently shift every later verdict onto the wrong
+   * record the moment one check is dropped.
+   */
+  const verdictByRecord = new Map<(typeof toCheck)[number], EvidenceVerdict>()
   const CONCURRENCY = 8
+  let failedChecks = 0
   for (let i = 0; i < toCheck.length; i += CONCURRENCY) {
     const batch = toCheck.slice(i, i + CONCURRENCY)
-    verdicts.push(...(await Promise.all(batch.map((f) => checkEvidence(f)))))
+    const settled = await Promise.all(
+      batch.map(async (f) => {
+        try {
+          const v = await checkEvidence(f, {
+            agentOwner: identity.owners.get(String(f.agentId))?.toLowerCase() ?? null,
+            archive,
+          })
+          return { rec: f, v }
+        } catch (err) {
+          /**
+           * One hostile file must not end the run. `Promise.all` rejects the
+           * whole batch on a single throw and the rejection reaches the top
+           * level, so a four-byte body used to abort an audit of ten thousand
+           * records — permanently, since the evidence phase has no resume.
+           * Failing this one record loudly is the only safe behaviour.
+           */
+          failedChecks++
+          console.error(`\n  ! evidence check threw for ${f.feedbackURI}: ${(err as Error).message}`)
+          return { rec: f, v: null }
+        }
+      }),
+    )
+    for (const { rec, v } of settled) if (v) verdictByRecord.set(rec, v)
     process.stdout.write(`\r  evidence: ${Math.min(i + CONCURRENCY, toCheck.length)}/${toCheck.length}`)
   }
   if (toCheck.length) process.stdout.write('\n')
+  if (failedChecks) console.log(`  ${failedChecks} check(s) threw and were dropped — see errors above`)
+  if (archive) console.log(`  archived ${archive.size} distinct evidence files under out/evidence-corpus/`)
+
+  const verdicts: EvidenceVerdict[] = [...verdictByRecord.values()]
 
   const rows = reconcile({ feedback, settlements, identity, selfVerified })
   const stats = summarize(rows)
@@ -140,14 +184,9 @@ async function main() {
    * the platform whose pipeline produced them — check that claim hash by hash
    * instead of taking the aggregate on faith.
    */
-  // Index verdicts by record so both exports below can look them up.
-  const verdictByRecord = new Map<(typeof toCheck)[number], (typeof verdicts)[number]>()
-  toCheck.forEach((rec, i) => { if (verdicts[i]) verdictByRecord.set(rec, verdicts[i]!) })
-
   const claimRows = toCheck
     .map((rec) => ({ rec, v: verdictByRecord.get(rec) }))
     .filter((x) => x.v?.claimsPayment)
-  const csvEsc = (val: unknown) => `"${String(val ?? '').replace(/"/g, '""')}"`
 
   /**
    * Every record whose evidence was actually checked, with the rung it reached.
@@ -158,36 +197,98 @@ async function main() {
    * resolves, a hash attested with no file at all) unrecorded. This file is the
    * full ladder, and it is what the attestation backfill consumes.
    */
+  const checkedRows = feedback
+    .filter((r) => verdictByRecord.has(r))
+    .map((rec) => ({ rec, v: verdictByRecord.get(rec)!, unchecked: false }))
+
+  /**
+   * Records that declared a file the fetch cap kept us from opening.
+   *
+   * Dropping them made the export silently shorter than the registry: they
+   * received no rung, so the ledger left them at `None` — "never attested" —
+   * which is the one state the contract promises is unforgeable. A sampled
+   * audit must say which records it skipped, not omit them.
+   */
+  const uncheckedRows = withPointer
+    .filter((r) => !verdictByRecord.has(r))
+    .map((rec) => ({ rec, v: undefined, unchecked: true }))
+
   const evidenceRows = [
-    // Records whose declared file was actually fetched and judged.
-    ...feedback.filter((r) => verdictByRecord.has(r)).map((rec) => ({ rec, v: verdictByRecord.get(rec)! })),
+    ...checkedRows,
+    ...uncheckedRows,
     // Records that attested a hash while declaring no file: identifiable from
     // the event alone, no fetch needed, and a third of the registry. Records
     // declaring neither URI nor hash are left unattested — there is no
     // evidence claim to verify, and the ledger's None default says exactly that.
-    ...feedback.filter((r) => !r.hasURI && r.hasHash).map((rec) => ({ rec, v: undefined })),
+    ...feedback.filter((r) => !r.hasURI && r.hasHash).map((rec) => ({ rec, v: undefined, unchecked: false })),
   ]
+
+  /**
+   * `feedbackIndex` is carried explicitly.
+   *
+   * It was omitted once, and the backfill had to recover it by joining on
+   * (agentId, reviewer, feedbackURI) — a triple that is not unique, because
+   * every record that publishes no file carries the same empty URI. Exporting
+   * the registry's own index removes the join, and with it a whole class of
+   * silent mis-attestation.
+   */
+  const EVIDENCE_HEADER = [
+    'timestamp', 'block', 'agentId', 'reviewer', 'feedbackIndex',
+    'rung', 'evidenceRung',
+    'hasURI', 'hasHash', 'fetched', 'jsonValid', 'hashMatched', 'inconclusive',
+    'claimsPayment', 'txExistsOnCelo', 'paymentVerified', 'paymentAttributed',
+    'partiesContradicted', 'onQueryableChain',
+    'claimTxHash', 'claimNetwork', 'amount', 'symbol', 'decimals',
+    'declaredFrom', 'declaredTo', 'transferFrom', 'transferTo', 'transferCount',
+    'evidenceHash', 'contentSha256', 'contentKeccak', 'bytes', 'observedAt', 'via',
+    'note', 'partyNote', 'feedbackURI',
+  ]
+
+  const UNCHECKED_NOTE = 'not checked — beyond MAX_FILE_FETCHES sampling cap'
+
   writeFileSync(
     'out/evidence.csv',
     [
-      'timestamp,block,agentId,reviewer,rung,hasURI,fetched,jsonValid,hashMatched,claimsPayment,txExistsOnCelo,paymentVerified,claimTxHash,evidenceHash,note,feedbackURI',
-      ...evidenceRows.map(({ rec, v }) =>
+      EVIDENCE_HEADER.join(','),
+      ...evidenceRows.map(({ rec, v, unchecked }) =>
         [
           new Date(rec.timestamp * 1000).toISOString(),
           rec.blockNumber,
           rec.agentId,
           rec.reviewer,
-          v ? rung(rec, v) : 'EvidenceAbsent',
+          rec.feedbackIndex,
+          v ? rung(rec, v) : unchecked ? 'EvidenceInconclusive' : 'EvidenceAbsent',
+          v ? evidenceRung(rec, v) : unchecked ? 'Inconclusive' : 'Absent',
           rec.hasURI,
+          rec.hasHash,
           v?.fetched ?? false,
           v?.jsonValid ?? false,
           v?.hashMatches ?? false,
+          v?.inconclusive ?? unchecked,
           v?.claimsPayment ?? false,
           v?.txExists ?? false,
           v?.paymentVerified ?? false,
+          v?.paymentAttributed ?? false,
+          v?.partiesContradicted ?? false,
+          v?.onQueryableChain ?? true,
           v?.claimTxHash ?? '',
+          v?.claimNetwork ?? '',
+          v?.amount == null ? '' : v.amount.toString(),
+          v?.symbol ?? '',
+          v?.decimals == null ? '' : String(v.decimals),
+          v?.declaredFrom ?? '',
+          v?.declaredTo ?? '',
+          v?.transferFrom ?? '',
+          v?.transferTo ?? '',
+          v?.transferCount ?? 0,
           rec.feedbackHash,
-          v?.note ?? '',
+          v?.sha256 ?? '',
+          v?.contentId ?? '',
+          v?.bytes == null ? '' : String(v.bytes),
+          v?.observedAt ? new Date(v.observedAt * 1000).toISOString() : '',
+          v?.via ?? '',
+          unchecked ? UNCHECKED_NOTE : (v?.note ?? ''),
+          v?.partyNote ?? '',
           rec.feedbackURI,
         ]
           .map(csvEsc)
@@ -195,21 +296,44 @@ async function main() {
       ),
     ].join('\n'),
   )
+
+  const CLAIMS_HEADER = [
+    'timestamp', 'block', 'agentId', 'reviewer', 'feedbackIndex',
+    'claimNetwork', 'onQueryableChain', 'claimTxHash', 'txExistsOnCelo',
+    'paymentVerified', 'paymentAttributed', 'partiesContradicted',
+    'amount', 'symbol', 'decimals',
+    'declaredFrom', 'declaredTo', 'transferFrom', 'transferTo', 'transferCount',
+    'note', 'partyNote', 'feedbackURI',
+  ]
+
   writeFileSync(
     'out/claims.csv',
     [
-      'timestamp,block,agentId,reviewer,claimNetwork,claimTxHash,txExistsOnCelo,paymentVerified,note,feedbackURI',
+      CLAIMS_HEADER.join(','),
       ...claimRows.map(({ rec, v }) =>
         [
           new Date(rec.timestamp * 1000).toISOString(),
           rec.blockNumber,
           rec.agentId,
           rec.reviewer,
-          v!.claimNetwork,
-          v!.claimTxHash,
+          rec.feedbackIndex,
+          v!.claimNetwork ?? '',
+          v!.onQueryableChain,
+          v!.claimTxHash ?? '',
           v!.txExists,
           v!.paymentVerified,
+          v!.paymentAttributed,
+          v!.partiesContradicted,
+          v!.amount == null ? '' : v!.amount.toString(),
+          v!.symbol ?? '',
+          v!.decimals == null ? '' : String(v!.decimals),
+          v!.declaredFrom ?? '',
+          v!.declaredTo ?? '',
+          v!.transferFrom ?? '',
+          v!.transferTo ?? '',
+          v!.transferCount,
           v?.note ?? '',
+          v?.partyNote ?? '',
           rec.feedbackURI,
         ]
           .map(csvEsc)
@@ -248,6 +372,10 @@ async function main() {
   console.log(`  claiming a payment          ${evidence.claimsPayment}`)
   console.log(`  claimed tx exists on chain  ${evidence.txExists}`)
   console.log(`  payment actually verified   ${evidence.paymentVerified}`)
+  console.log(`  …and attributable to both   ${evidence.paymentAttributed}`)
+  console.log(`  parties contradict claim    ${evidence.partyMismatch}`)
+  console.log(`  declared on another chain   ${evidence.foreignChain}`)
+  console.log(`  retrieval inconclusive      ${evidence.inconclusive}  (not a finding)`)
     if (settlements.length || process.env.SKIP_SETTLEMENTS === '0') {
     console.log(`  reviewer demonstrably paid  ${stats.backed}`)
   }
@@ -256,7 +384,8 @@ async function main() {
   console.log(
     `\nWrote out/audit.md, out/audit.json, out/samples.json,\n` +
       `      out/claims.csv (${claimRows.length} payment claims) and\n` +
-      `      out/evidence.csv (${evidenceRows.length} checked records — the full ladder)`,
+      `      out/evidence.csv (${evidenceRows.length} records — the full ladder)` +
+      (archive ? `\n      out/evidence-corpus/ (${archive.size} archived files, content-addressed)` : ''),
   )
 }
 

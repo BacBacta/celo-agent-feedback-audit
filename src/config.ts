@@ -92,3 +92,65 @@ export const AUTHORIZATION_USED_EVENT = parseAbiItem(
 
 export const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000' as Address
 export const ZERO_HASH = '0x0000000000000000000000000000000000000000000000000000000000000000'
+
+// ---------------------------------------------------------------------------
+// Evidence retrieval
+// ---------------------------------------------------------------------------
+
+/**
+ * Ceiling on a retrieved evidence file, in bytes.
+ *
+ * `feedbackURI` is attacker-controlled, so the response size is chosen by the
+ * party being audited. Without a cap, one two-gigabyte body ends the run with
+ * an out-of-memory kill instead of a verdict — free for them, fatal for us.
+ * A megabyte is two orders of magnitude above any real feedback file.
+ */
+export const EVIDENCE_MAX_BYTES = Number(process.env.EVIDENCE_MAX_BYTES ?? 1_048_576)
+
+/** Deadline covering headers AND body, per attempt. */
+export const EVIDENCE_TIMEOUT_MS = Number(process.env.EVIDENCE_TIMEOUT_MS ?? 8_000)
+
+/**
+ * Passes over the full gateway list before a file is called unreachable.
+ *
+ * One GET cannot tell a dead link from a busy gateway, and a verdict published
+ * on that basis is exactly the silent misclassification this audit exists to
+ * expose. Two passes, spread in time, is the cheapest honest minimum.
+ */
+export const EVIDENCE_ATTEMPTS = Number(process.env.EVIDENCE_ATTEMPTS ?? 2)
+
+/** Base backoff between passes; multiplied by the pass number. */
+export const EVIDENCE_RETRY_DELAY_MS = Number(process.env.EVIDENCE_RETRY_DELAY_MS ?? 2_000)
+
+/** Redirect hops followed before giving up. Each hop is re-checked for SSRF. */
+export const MAX_REDIRECTS = Number(process.env.MAX_REDIRECTS ?? 5)
+
+/**
+ * Independent IPFS gateways, tried in order.
+ *
+ * A CID resolves to the same bytes everywhere, so "ipfs.io said no" is a fact
+ * about ipfs.io. Auditing 10,000 files through one notoriously rate-limited
+ * gateway manufactured an unknown number of false "dead link" findings; the
+ * only fix that costs nothing is to ask somebody else too.
+ */
+export const IPFS_GATEWAYS = (process.env.IPFS_GATEWAYS ?? [
+  'https://ipfs.io/ipfs/',
+  'https://cloudflare-ipfs.com/ipfs/',
+  'https://dweb.link/ipfs/',
+  'https://gateway.pinata.cloud/ipfs/',
+].join(',')).split(',').map((g) => g.trim()).filter(Boolean)
+
+/** Same reasoning for Arweave, whose `ar://` scheme was previously undecodable. */
+export const ARWEAVE_GATEWAYS = (process.env.ARWEAVE_GATEWAYS ?? [
+  'https://arweave.net/',
+  'https://ar-io.net/',
+].join(',')).split(',').map((g) => g.trim()).filter(Boolean)
+
+/**
+ * The chain this audit can actually query.
+ *
+ * A file may declare its payment on another network. We cannot confirm or deny
+ * those, and saying "not found on Celo" about a Base transaction reports a
+ * finding we did not make.
+ */
+export const QUERYABLE_CHAIN_IDS = new Set<string>(['42220', 'celo', 'celo-mainnet'])
