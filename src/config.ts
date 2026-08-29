@@ -155,10 +155,13 @@ export const MAX_REDIRECTS = envNumber('MAX_REDIRECTS', 5, 0)
  */
 export const IPFS_GATEWAYS = (process.env.IPFS_GATEWAYS ?? [
   'https://ipfs.io/ipfs/',
-  'https://cloudflare-ipfs.com/ipfs/',
   'https://dweb.link/ipfs/',
   'https://gateway.pinata.cloud/ipfs/',
+  'https://4everland.io/ipfs/',
 ].join(',')).split(',').map((g) => g.trim()).filter(Boolean)
+// cloudflare-ipfs.com was in this list and no longer resolves at all —
+// Cloudflare retired the gateway. A dead entry here is not free: it spends an
+// attempt on every single file, and until the fix above it also condemned them.
 
 /** Same reasoning for Arweave, whose `ar://` scheme was previously undecodable. */
 export const ARWEAVE_GATEWAYS = (process.env.ARWEAVE_GATEWAYS ?? [

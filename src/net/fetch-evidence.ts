@@ -119,26 +119,38 @@ export function isPrivateAddress(ip: string): boolean {
  * not stop an adversary who controls a nameserver. Said plainly here rather
  * than left to be discovered.
  */
-async function guardHost(url: URL): Promise<string | null> {
+type Refusal = { kind: 'unusable' | 'inconclusive'; note: string }
+
+async function guardHost(url: URL): Promise<Refusal | null> {
   // `url.hostname` already excludes any userinfo and port, so the credentials
   // form (http://real-host@127.0.0.1/) is checked against 127.0.0.1, which is
   // the host that will actually be contacted.
   const host = url.hostname.replace(/^\[|\]$/g, '')
   if (/^(localhost|.*\.localhost|.*\.local|.*\.internal)$/i.test(host)) {
-    return `refused private host ${host}`
+    return { kind: 'unusable', note: `refused private host ${host}` }
   }
   if (isIP(host)) {
-    return isPrivateAddress(host) ? `refused private address ${host}` : null
+    return isPrivateAddress(host) ? { kind: 'unusable', note: `refused private address ${host}` } : null
   }
   let addrs
   try {
     addrs = await lookup(host, { all: true })
   } catch {
-    return `cannot resolve ${host}`
+    /**
+     * A name that does not resolve says nothing about the evidence.
+     *
+     * It was classed alongside the SSRF refusals — as a fact about the URI —
+     * and that is wrong twice over. A nameserver can be down, and more to the
+     * point the host being resolved is often OUR gateway rather than anything
+     * the publisher chose: cloudflare-ipfs.com was shipped in the default
+     * gateway list and has since been shut down, so every content-addressed
+     * file was one dead gateway away from being written off as a dead link.
+     */
+    return { kind: 'inconclusive', note: `cannot resolve ${host}` }
   }
-  if (!addrs.length) return `cannot resolve ${host}`
+  if (!addrs.length) return { kind: 'inconclusive', note: `cannot resolve ${host}` }
   const bad = addrs.find((a) => isPrivateAddress(a.address))
-  return bad ? `refused private address ${bad.address} for ${host}` : null
+  return bad ? { kind: 'unusable', note: `refused private address ${bad.address} for ${host}` } : null
 }
 
 /**
@@ -195,7 +207,9 @@ async function fetchOnce(target: string, timeoutMs: number, maxBytes: number): P
         return { kind: 'unusable', note: `refused redirect to ${parsed.protocol.replace(':', '')}` }
       }
       const refusal = await guardHost(parsed)
-      if (refusal) return { kind: 'unusable', note: refusal }
+      if (refusal) return refusal.kind === 'unusable'
+        ? { kind: 'unusable', note: refusal.note }
+        : { kind: 'inconclusive', note: refusal.note, url }
 
       const res = await fetch(url, {
         signal: ctrl.signal,
@@ -340,10 +354,18 @@ export async function fetchEvidence(
     for (const target of targets) {
       const out = await fetchOnce(target, timeoutMs, maxBytes)
       if (out.kind === 'ok') return out
-      // The URI is unusable by anyone; another gateway will not change that.
-      if (out.kind === 'unusable') return out
+      /**
+       * An unusable TARGET condemns the URI only when the target IS the URI.
+       *
+       * For a content-addressed file the targets are our own gateways, and one
+       * of them being unusable is a fact about that gateway. Returning here
+       * regardless meant a single bad entry in the gateway list could write off
+       * every ipfs:// record in the registry as a dead link without asking
+       * anybody else — the exact misclassification this module exists to prevent.
+       */
+      if (out.kind === 'unusable' && targets.length === 1) return out
       lastByTarget.set(target, out)
-      if (out.kind !== 'dead') stalledByTarget.add(target)
+      if (out.kind !== 'dead' && out.kind !== 'unusable') stalledByTarget.add(target)
       // A gateway that rate-limited us tells us nothing; try the next one now.
     }
     // Every target failed. Only wait if something might still change.

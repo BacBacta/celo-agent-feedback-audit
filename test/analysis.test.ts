@@ -522,6 +522,8 @@ check('public IPv6 is still reachable', () => {
   }
 })
 
+const GATEWAYS = await import('../src/config.js')
+
 console.log('\nURI resolution')
 
 check('a content-addressed URI fans out across independent gateways', () => {
@@ -541,6 +543,22 @@ check('Arweave and data URIs resolve instead of being written off', () => {
   assert.equal(resolveTargets('ar://abc').scheme, 'ar')
   assert.ok(resolveTargets('ar://abc').targets.length >= 1)
   assert.equal(resolveTargets('data:application/json,{}').scheme, 'data')
+})
+
+check('the gateway list contains no host that has stopped existing', () => {
+  /**
+   * A dead entry is not free. cloudflare-ipfs.com shipped in this list and has
+   * since been retired: it spent an attempt on every content-addressed file,
+   * and — until the classification was fixed — its DNS failure was recorded as
+   * a fact about the file rather than about the gateway, writing live evidence
+   * off as a dead link.
+   */
+  const { IPFS_GATEWAYS, ARWEAVE_GATEWAYS } = GATEWAYS
+  for (const g of [...IPFS_GATEWAYS, ...ARWEAVE_GATEWAYS]) {
+    assert.doesNotMatch(g, /cloudflare-ipfs\.com/, 'cloudflare retired this gateway')
+    assert.match(g, /^https:\/\/[^/]+\//, `${g} should be an https gateway prefix`)
+  }
+  assert.ok(IPFS_GATEWAYS.length >= 2, 'one gateway is not a measurement')
 })
 
 check('a scheme with no transport is named, not silently dropped', () => {
