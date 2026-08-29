@@ -32,6 +32,12 @@ export function parseCsvRows(text) {
   let cur = ''
   let inQuotes = false
   let sawAny = false
+  // Physical line where the current record started. A record may legitimately
+  // span several lines, and a diagnostic that points at the wrong one sends an
+  // operator to the wrong place in a file with twenty thousand rows.
+  let startLine = 1
+  let line = 1
+  row.__line = startLine
 
   for (let i = 0; i < text.length; i++) {
     const ch = text[i]
@@ -39,7 +45,10 @@ export function parseCsvRows(text) {
       if (ch === '"') {
         if (text[i + 1] === '"') { cur += '"'; i++ }
         else inQuotes = false
-      } else cur += ch
+      } else {
+        if (ch === '\n') line++
+        cur += ch
+      }
       continue
     }
     if (ch === '"') { inQuotes = true; sawAny = true; continue }
@@ -48,11 +57,13 @@ export function parseCsvRows(text) {
       // Tolerate CRLF without letting the CR survive into the last cell, which
       // silently corrupted every value of the final column.
       if (text[i + 1] === '\n') i++
-      row.push(cur); rows.push(row); row = []; cur = ''; sawAny = false
+      row.push(cur); rows.push(row); line++; startLine = line
+      row = []; row.__line = startLine; cur = ''; sawAny = false
       continue
     }
     if (ch === '\n') {
-      row.push(cur); rows.push(row); row = []; cur = ''; sawAny = false
+      row.push(cur); rows.push(row); line++; startLine = line
+      row = []; row.__line = startLine; cur = ''; sawAny = false
       continue
     }
     cur += ch
@@ -77,23 +88,37 @@ export function unescapeCell(cell) {
     else if (next === 'r') { out += '\r'; i++ }
     else if (next === 't') { out += '\t'; i++ }
     else if (next === '\\') { out += '\\'; i++ }
+    else if (next === 'u' && /^[0-9a-fA-F]{4}$/.test(cell.slice(i + 2, i + 6))) {
+      out += String.fromCharCode(parseInt(cell.slice(i + 2, i + 6), 16))
+      i += 5
+    }
     else out += '\\'
   }
   return out
 }
 
-/** Escape one value for writing. Mirror image of `unescapeCell`. */
+/**
+ * Escape one value for writing. Mirror image of `unescapeCell`.
+ *
+ * Every byte is escaped, never dropped. Dropping unprintable characters looked
+ * harmless and was not: it made the transform non-injective, so two distinct
+ * feedbackURI values — one carrying a stray control character, one without —
+ * collapsed to the same string. Downstream that string is a join key, and two
+ * records that were never the same record became one: the wrong feedbackIndex
+ * received the other's verdict, and every collision counter stayed at zero,
+ * because from the join's point of view nothing had gone wrong.
+ */
 export function escapeCell(val) {
   return `"${String(val ?? '')
     .replace(/\\/g, '\\\\')
     .replace(/\r/g, '\\r')
     .replace(/\n/g, '\\n')
     .replace(/\t/g, '\\t')
-    .replace(CONTROL_CHARS, '')
+    .replace(CONTROL_CHARS, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'))
     .replace(/"/g, '""')}"`
 }
 
-/** Anything still unprintable after the named escapes above is simply dropped. */
+/** Anything still unprintable after the named escapes above becomes \\uXXXX. */
 const CONTROL_CHARS = new RegExp('[\\u0000-\\u001f\\u007f]', 'g')
 
 /**
@@ -113,10 +138,16 @@ export function parseCsvStrict(text) {
     const cells = rows[i]
     if (cells.length !== header.length) {
       malformed.push({
-        line: i + 1,
+        // The physical line the record starts on, not its ordinal among the
+        // records that survived parsing — the two diverge exactly when a row is
+        // torn, which is the only time anyone reads this number.
+        line: cells.__line ?? i + 1,
         cells: cells.length,
         expected: header.length,
-        raw: cells.join(',').slice(0, 200),
+        // The cells as parsed, delimited so the count is visible. Re-joining
+        // them with plain commas produced a string whose comma count
+        // contradicted the `cells` figure printed beside it.
+        raw: cells.map((c) => JSON.stringify(c)).join(' | ').slice(0, 200),
       })
       continue
     }

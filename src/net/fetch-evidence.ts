@@ -36,13 +36,27 @@ export type FetchOutcome =
   | { kind: 'dead'; status: number; note: string; url: string }
   /** We could not get an answer we trust. NOT evidence that the file is gone. */
   | { kind: 'inconclusive'; note: string; url: string | null }
-  /** No transport exists for this scheme, so absence was never testable. */
-  | { kind: 'unresolvable'; note: string }
-  /** The URI pointed inside our own infrastructure and was refused unfetched. */
-  | { kind: 'refused'; note: string }
+  /**
+   * The URI itself is unusable — a scheme with no transport, or one pointing
+   * into private address space. Decided locally, with no network involved, so
+   * it is a fact about the record and not a failure to reach anything: a
+   * publisher who declares `magnet:?xt=…` has declared evidence nobody can
+   * retrieve, and treating that as "we could not check" would make a junk URI
+   * strictly safer to publish than an honest dead link.
+   */
+  | { kind: 'unusable'; note: string }
 
-/** 404/410 are the only statuses a server uses to assert "this does not exist". */
-const DEAD_STATUSES = new Set([400, 401, 403, 404, 410, 451])
+/**
+ * The only statuses in which a server asserts the resource is not there.
+ *
+ * 400, 401, 403 and 451 were in this set and should never have been: they mean
+ * "I will not serve you this", not "there is nothing here". A WAF answering 403
+ * to an unfamiliar user agent, a gateway requiring a key, a jurisdictional
+ * block — each fabricated a published `EvidenceUnreachable` for a file that was
+ * alive and would have hashed correctly. That is the misclassification this
+ * audit exists to expose, committed by the audit.
+ */
+const DEAD_STATUSES = new Set([404, 410])
 /** Everything else that is not 2xx is the network having a bad day, not a finding. */
 const isRateLimited = (s: number) => s === 429 || s === 408 || s >= 500
 
@@ -58,11 +72,28 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 export function isPrivateAddress(ip: string): boolean {
   if (isIP(ip) === 6) {
     const v6 = ip.toLowerCase()
-    if (v6 === '::1' || v6 === '::' ) return true
-    if (v6.startsWith('fe80') || v6.startsWith('fc') || v6.startsWith('fd')) return true
-    // IPv4-mapped (::ffff:127.0.0.1) smuggles the whole v4 problem into v6.
-    const mapped = v6.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/)
-    if (mapped) return isPrivateAddress(mapped[1]!)
+    if (v6 === '::1' || v6 === '::') return true
+    if (/^f[cd]/.test(v6)) return true // fc00::/7 unique-local
+    if (/^fe[89ab]/.test(v6)) return true // fe80::/10 link-local — not only fe80::/16
+    /**
+     * IPv4-mapped addresses smuggle the whole v4 problem into v6, and the
+     * dotted form is the one they are almost never written in by the time this
+     * function sees them: `new URL()` normalises ::ffff:127.0.0.1 to
+     * ::ffff:7f00:1, so a check that only matched the dotted spelling could
+     * never fire on a hostname taken from a parsed URL. That left
+     * http://[::ffff:a9fe:a9fe]/ — the cloud metadata endpoint — passing the
+     * guard untouched.
+     */
+    const dotted = /^(?:0*:)*ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(v6)
+    if (dotted) return isPrivateAddress(dotted[1]!)
+    const hexed = /^(?:0*:)*ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(v6)
+    if (hexed) {
+      const hi = parseInt(hexed[1]!, 16)
+      const lo = parseInt(hexed[2]!, 16)
+      return isPrivateAddress([hi >> 8, hi & 255, lo >> 8, lo & 255].join('.'))
+    }
+    // NAT64 (64:ff9b::/96) reaches v4 space through a translator.
+    if (/^64:ff9b:/.test(v6)) return true
     return false
   }
   const p = ip.split('.').map(Number)
@@ -77,7 +108,21 @@ export function isPrivateAddress(ip: string): boolean {
   return false
 }
 
+/**
+ * KNOWN LIMIT: this resolves the name, and then `fetch` resolves it again.
+ *
+ * Between the two lookups a record with a short TTL can change, so a host that
+ * answered with a public address at check time can answer with a private one at
+ * connect time. Closing that window needs a dispatcher that connects to the
+ * address this function actually approved, which Node's built-in fetch does not
+ * expose. The guard therefore stops a URI that simply points inside, and does
+ * not stop an adversary who controls a nameserver. Said plainly here rather
+ * than left to be discovered.
+ */
 async function guardHost(url: URL): Promise<string | null> {
+  // `url.hostname` already excludes any userinfo and port, so the credentials
+  // form (http://real-host@127.0.0.1/) is checked against 127.0.0.1, which is
+  // the host that will actually be contacted.
   const host = url.hostname.replace(/^\[|\]$/g, '')
   if (/^(localhost|.*\.localhost|.*\.local|.*\.internal)$/i.test(host)) {
     return `refused private host ${host}`
@@ -145,12 +190,12 @@ async function fetchOnce(target: string, timeoutMs: number, maxBytes: number): P
   try {
     for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
       let parsed: URL
-      try { parsed = new URL(url) } catch { return { kind: 'unresolvable', note: 'malformed URL' } }
+      try { parsed = new URL(url) } catch { return { kind: 'unusable', note: 'malformed URL' } }
       if (!/^https?:$/i.test(parsed.protocol)) {
-        return { kind: 'refused', note: `refused redirect to ${parsed.protocol.replace(':', '')}` }
+        return { kind: 'unusable', note: `refused redirect to ${parsed.protocol.replace(':', '')}` }
       }
       const refusal = await guardHost(parsed)
-      if (refusal) return { kind: 'refused', note: refusal }
+      if (refusal) return { kind: 'unusable', note: refusal }
 
       const res = await fetch(url, {
         signal: ctrl.signal,
@@ -170,12 +215,20 @@ async function fetchOnce(target: string, timeoutMs: number, maxBytes: number): P
         if (DEAD_STATUSES.has(res.status)) {
           return { kind: 'dead', status: res.status, note: `HTTP ${res.status}`, url }
         }
+        // Refused, rate limited, broken — all of them mean the file was never
+        // tested, and none of them is evidence about the file.
         return { kind: 'inconclusive', note: `HTTP ${res.status}`, url }
       }
 
       const body = await readCapped(res, maxBytes)
       if (body === 'too-large') {
-        return { kind: 'dead', status: res.status, note: `oversize body (> ${maxBytes} bytes)`, url }
+        /**
+         * Something is served here; we declined to read all of it. Calling that
+         * "the file does not exist" let a single mendacious Content-Length
+         * header manufacture a dead-link verdict without sending a byte — and
+         * it is not what we observed in any case.
+         */
+        return { kind: 'inconclusive', note: `oversize body (over ${maxBytes} bytes)`, url }
       }
       return {
         kind: 'ok',
@@ -198,7 +251,7 @@ async function fetchOnce(target: string, timeoutMs: number, maxBytes: number): P
 /** Percent/base64 payloads carried in the URI itself — no network, always live. */
 function readDataUri(uri: string, maxBytes: number): FetchOutcome {
   const m = /^data:([^,]*),([\s\S]*)$/i.exec(uri)
-  if (!m) return { kind: 'unresolvable', note: 'malformed data: URI' }
+  if (!m) return { kind: 'unusable', note: 'malformed data: URI' }
   const meta = m[1] ?? ''
   const payload = m[2] ?? ''
   try {
@@ -206,14 +259,14 @@ function readDataUri(uri: string, maxBytes: number): FetchOutcome {
       ? new Uint8Array(Buffer.from(payload, 'base64'))
       : new TextEncoder().encode(decodeURIComponent(payload))
     if (bytes.byteLength > maxBytes) {
-      return { kind: 'dead', status: 200, note: `oversize body (> ${maxBytes} bytes)`, url: 'data:' }
+      return { kind: 'inconclusive', note: `oversize body (over ${maxBytes} bytes)`, url: 'data:' }
     }
     return {
       kind: 'ok', bytes, text: new TextDecoder('utf-8').decode(bytes),
       url: 'data:', status: 200, via: 'data:',
     }
   } catch {
-    return { kind: 'unresolvable', note: 'undecodable data: URI' }
+    return { kind: 'unusable', note: 'undecodable data: URI' }
   }
 }
 
@@ -267,19 +320,30 @@ export async function fetchEvidence(
 
   const { targets, scheme } = resolveTargets(uri)
   if (!targets.length) {
-    return { kind: 'unresolvable', note: scheme ? `unresolvable URI scheme: ${scheme}` : 'empty URI' }
+    return { kind: 'unusable', note: scheme ? `unresolvable URI scheme: ${scheme}` : 'empty URI' }
   }
   if (scheme === 'data') return readDataUri(targets[0]!, maxBytes)
 
-  let lastDead: FetchOutcome | null = null
-  let lastOther: FetchOutcome | null = null
+  /**
+   * Per target, not per grid.
+   *
+   * Tracking one "was anything inconclusive anywhere" flag across every target
+   * and every pass meant a single stalled gateway permanently outvoted a
+   * different gateway that answered 404 on every pass it was asked — the
+   * evidence for death got stronger while the verdict stayed inconclusive.
+   * A target is dead when its LAST word was 404 and it never once stalled.
+   */
+  const lastByTarget = new Map<string, FetchOutcome>()
+  const stalledByTarget = new Set<string>()
 
   for (let attempt = 0; attempt < attempts; attempt++) {
     for (const target of targets) {
       const out = await fetchOnce(target, timeoutMs, maxBytes)
       if (out.kind === 'ok') return out
-      if (out.kind === 'dead') lastDead = out
-      else lastOther = out
+      // The URI is unusable by anyone; another gateway will not change that.
+      if (out.kind === 'unusable') return out
+      lastByTarget.set(target, out)
+      if (out.kind !== 'dead') stalledByTarget.add(target)
       // A gateway that rate-limited us tells us nothing; try the next one now.
     }
     // Every target failed. Only wait if something might still change.
@@ -287,13 +351,19 @@ export async function fetchEvidence(
   }
 
   /**
-   * A single gateway asserting 404 while others merely stalled is not proof of
-   * death for a content-addressed file — the CID may be alive on a peer none of
-   * our gateways asked. Only call it dead when nothing inconclusive happened.
+   * One host asserting absence is enough when that host was answering
+   * consistently — but for a content-addressed file spread over several
+   * gateways, a 404 from one that also stalled says nothing: the CID may be
+   * alive on a peer nobody asked.
    */
-  if (lastDead && (!lastOther || targets.length === 1)) return lastDead
-  if (lastOther) return lastOther
-  return lastDead ?? { kind: 'inconclusive', note: 'no attempt completed', url: targets[0] ?? null }
+  for (const target of targets) {
+    const last = lastByTarget.get(target)
+    if (last?.kind === 'dead' && !stalledByTarget.has(target)) return last
+  }
+  const anyOther = targets.map((t) => lastByTarget.get(t)).find((o) => o && o.kind !== 'dead')
+  if (anyOther) return anyOther
+  const anyDead = targets.map((t) => lastByTarget.get(t)).find((o) => o?.kind === 'dead')
+  return anyDead ?? { kind: 'inconclusive', note: 'no attempt completed', url: targets[0] ?? null }
 }
 
 export { isRateLimited }

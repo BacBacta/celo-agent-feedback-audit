@@ -32,8 +32,12 @@ here are deliberately the same ones, so the results are directly comparable.
   settled transfer. Each step is reported separately, because the interesting
   result is *where* the chain of evidence breaks.
 - **Payment attribution** — whether a settled payment was made *by this reviewer
-  to this agent*, which is a strictly stronger fact than the payment merely
-  existing. Anyone can cite any real transfer on the chain, so "verified" is a
+  to this agent*, and **how much of it actually reached the agent**. The amount
+  is bounded at both ends — never more than the reviewer sent, never more than
+  the agent owner received — so a transaction that moves 500 USDC between two of
+  the reviewer's own addresses and one millionth of a dollar to the agent is
+  reported as backing 0.000001, not 500. This is a strictly stronger fact than
+  the payment merely existing. Anyone can cite any real transfer on the chain, so "verified" is a
   floor and only "attributed" is a filter. Settlements whose parties contradict
   the file that names them are reported separately again, as accusations rather
   than as confirmations.
@@ -115,9 +119,17 @@ the distinction is the difference between a finding and a failure to measure:
 
 | Outcome | Meaning | Is it a finding? |
 |---|---|---|
-| `EvidenceUnreachable` | a host answered 404/410 — it asserts the file is absent | yes |
-| `EvidenceInconclusive` | rate limit, timeout, every gateway busy, or beyond the sampling cap | **no** |
+| `EvidenceUnreachable` | a host answered **404 or 410** — it asserts the file is absent | yes |
+| `EvidenceUnreachable` | the URI itself is unusable: unknown scheme, malformed, or pointing into private address space | yes — decided locally, no network involved |
+| `EvidenceInconclusive` | rate limit, timeout, 403, 5xx, every gateway busy, oversize body, or beyond the sampling cap | **no** |
 | `EvidenceUnhashed` | the file resolved and does not match its attested digest | yes, but see below |
+
+Only 404 and 410 are read as absence. A 403 from a WAF, a 401 from a gateway
+wanting a key, a 451 block — those mean "I will not serve you this", not "there
+is nothing here", and counting them as dead links would fabricate findings about
+files that are alive. A body above the cap is inconclusive for the same reason:
+something is served there, we simply declined to read all of it, and a
+mendacious `Content-Length` must not be able to manufacture a verdict.
 
 `EvidenceUnhashed` says the bytes served today do not hash to what was attested.
 It does **not** date the divergence and does not prove tampering: a publisher who
@@ -125,6 +137,12 @@ hashed with sha256, or whose server re-serialises the JSON or adds a BOM, fails
 the check from the first day. The export therefore carries `contentSha256`
 alongside the keccak digest, so a publisher can see which of the two their file
 actually matches.
+
+**A known limit:** the SSRF guard resolves the hostname and then `fetch`
+resolves it again, so a DNS record with a short TTL can change between the two.
+Closing that window needs a dispatcher that connects to the address the guard
+approved, which Node's built-in `fetch` does not expose. The guard stops a URI
+that points inside; it does not stop an adversary who controls a nameserver.
 
 Evidence retrieval is bounded and re-tried rather than taken on one attempt:
 each URI is tried across independent IPFS/Arweave gateways, twice, with the

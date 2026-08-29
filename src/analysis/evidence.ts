@@ -136,20 +136,25 @@ export async function checkEvidence(
   })
 
   if (outcome.kind !== 'ok') {
-    // Only a host asserting absence is a finding. Rate limits, timeouts, refused
-    // private targets and unknown schemes all mean the file was never tested —
-    // recording them as dead links is the misclassification this audit exists
-    // to expose, and it used to commit it 9,409 times.
-    const inconclusive = outcome.kind !== 'dead'
+    /**
+     * Three outcomes, and only one of them is a failure to measure.
+     *
+     *  - `dead`     a host answered 404 or 410: it asserts the file is gone.
+     *  - `unusable` the URI itself cannot be retrieved by anyone — an unknown
+     *               scheme, a malformed URL, a target in private address space.
+     *               Decided locally, with no network involved, so it is a fact
+     *               about the record. Filing it as "inconclusive" would make a
+     *               junk URI strictly safer to publish than an honest dead link.
+     *  - anything else was never tested: rate limits, timeouts, gateway
+     *    outages. Recording those as dead links is the misclassification this
+     *    audit exists to expose, and it used to commit it 9,409 times.
+     */
+    const inconclusive = outcome.kind !== 'dead' && outcome.kind !== 'unusable'
     return {
       ...base,
       hasPointer: true,
       inconclusive,
-      note: outcome.kind === 'unresolvable' || outcome.kind === 'refused'
-        ? outcome.note
-        : outcome.kind === 'dead'
-          ? outcome.note
-          : `${outcome.note} (inconclusive)`,
+      note: inconclusive ? `${outcome.note} (inconclusive)` : outcome.note,
     }
   }
 
@@ -219,18 +224,30 @@ export async function checkEvidence(
   })
 
   const paymentVerified = check.exists && check.succeeded && check.movedValue
+  const paymentAttributed = paymentVerified && parties.attributed
+
+  /**
+   * An attributed record publishes the attributed amount, not the transaction's
+   * largest transfer. They are the same number for an ordinary payment and
+   * wildly different for a crafted one, and it is the published figure that a
+   * consumer applies its threshold to.
+   */
+  const amount = paymentAttributed ? parties.attributedAmount : check.amount
+  const symbol = paymentAttributed ? parties.attributedSymbol : check.symbol
+  const decimals = paymentAttributed ? parties.attributedDecimals : check.decimals
+  const token = paymentAttributed ? parties.attributedToken : check.token
 
   return {
     ...claimed,
     txExists: check.exists,
     paymentVerified,
-    paymentAttributed: paymentVerified && parties.attributed,
+    paymentAttributed,
     partiesContradicted: paymentVerified && parties.contradicted,
     onQueryableChain: check.onQueryableChain,
-    amount: check.amount,
-    symbol: check.symbol,
-    decimals: check.decimals,
-    token: check.token,
+    amount,
+    symbol,
+    decimals,
+    token,
     transferFrom: check.from,
     transferTo: check.to,
     transferCount: check.transfers.length,

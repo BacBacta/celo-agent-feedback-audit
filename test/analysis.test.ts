@@ -496,6 +496,32 @@ check('the cloud metadata endpoint is refused specifically', () => {
   assert.equal(isPrivateAddress('169.254.169.254'), true)
 })
 
+check('IPv4-mapped IPv6 is refused in the spelling new URL actually produces', () => {
+  /**
+   * The bypass that made the whole guard decorative. `new URL()` normalises
+   * ::ffff:127.0.0.1 to ::ffff:7f00:1, so a check matching only the dotted
+   * spelling could never fire on a hostname taken from a parsed URL — and
+   * http://[::ffff:a9fe:a9fe]/ walked straight to the metadata endpoint.
+   */
+  assert.equal(new URL('http://[::ffff:127.0.0.1]/').hostname, '[::ffff:7f00:1]')
+  for (const ip of ['::ffff:7f00:1', '::ffff:a9fe:a9fe', '::ffff:0a00:1', '::ffff:c0a8:1', '::ffff:127.0.0.1']) {
+    assert.equal(isPrivateAddress(ip), true, `${ip} should be refused`)
+  }
+})
+
+check('link-local and unique-local cover their whole ranges, not just one prefix', () => {
+  // fe80::/10 is fe80 through febf, not fe80 alone.
+  for (const ip of ['fe80::1', 'fe90::1', 'feab::1', 'fc00::1', 'fd12:3456::1', '64:ff9b::7f00:1']) {
+    assert.equal(isPrivateAddress(ip), true, `${ip} should be refused`)
+  }
+})
+
+check('public IPv6 is still reachable', () => {
+  for (const ip of ['2606:4700::1', '2001:4860:4860::8888', 'fe00::1']) {
+    assert.equal(isPrivateAddress(ip), false, `${ip} should be allowed`)
+  }
+})
+
 console.log('\nURI resolution')
 
 check('a content-addressed URI fans out across independent gateways', () => {
@@ -600,6 +626,65 @@ check('a routed payment still attributes, and says it was routed', () => {
   const m = matchParties({ check: routed, reviewer: REVIEWER_A, agentOwner: AGENT_OWNER, declaredFrom: null, declaredTo: null })
   assert.equal(m.attributed, true)
   assert.match(m.note, /separate legs/)
+})
+
+check('the attributed amount is bounded by what the agent actually received', () => {
+  /**
+   * The inflation attack. One transaction, two legs: 500 USDC to the
+   * reviewer's own second address, and one millionth of a dollar to the agent.
+   * Both ends of the attribution check pass. Publishing the transaction's
+   * largest transfer would advertise 500 USDC of backing for a review that paid
+   * the agent 0.000001, and a consumer filtering at 500 would admit it.
+   */
+  const USDC = '0xcebA9300f2b948710d2653dD7B07f33A8B32118C' as Address
+  const inflated = {
+    ...settled(REVIEWER_A, AGENT_OWNER),
+    amount: 500_000_000n,
+    transfers: [
+      { token: USDC, symbol: 'USDC', decimals: 6, from: REVIEWER_A as Address, to: '0xaaaa000000000000000000000000000000000099' as Address, value: 500_000_000n },
+      { token: USDC, symbol: 'USDC', decimals: 6, from: REVIEWER_A as Address, to: AGENT_OWNER as Address, value: 1n },
+    ],
+  }
+  const m = matchParties({ check: inflated, reviewer: REVIEWER_A, agentOwner: AGENT_OWNER, declaredFrom: null, declaredTo: null })
+  assert.equal(m.attributed, true, 'the agent was paid, so attribution holds')
+  assert.equal(m.attributedAmount, 1n, 'but only for what it actually received')
+  assert.equal(m.attributedToken?.toLowerCase(), USDC.toLowerCase())
+})
+
+check('an ordinary single-leg payment reports its full value', () => {
+  const m = matchParties({ check: settled(REVIEWER_A, AGENT_OWNER), reviewer: REVIEWER_A, agentOwner: AGENT_OWNER, declaredFrom: null, declaredTo: null })
+  assert.equal(m.attributed, true)
+  assert.equal(m.attributedAmount, 1_000_000n)
+})
+
+check('a routed payment is bounded by the smaller of the two hops', () => {
+  const USDC = '0xcebA9300f2b948710d2653dD7B07f33A8B32118C' as Address
+  const routed = {
+    ...settled(REVIEWER_A, STRANGER_1),
+    transfers: [
+      { token: USDC, symbol: 'USDC', decimals: 6, from: REVIEWER_A as Address, to: STRANGER_1 as Address, value: 1_000_000n },
+      { token: USDC, symbol: 'USDC', decimals: 6, from: STRANGER_1 as Address, to: AGENT_OWNER as Address, value: 990_000n },
+    ],
+  }
+  const m = matchParties({ check: routed, reviewer: REVIEWER_A, agentOwner: AGENT_OWNER, declaredFrom: null, declaredTo: null })
+  assert.equal(m.attributed, true)
+  assert.equal(m.attributedAmount, 990_000n, 'the agent received 990,000, so that is the backing')
+})
+
+check('a file honestly declaring a routed payment is not accused', () => {
+  // declarationHonest used to require both declared parties on ONE leg, so a
+  // correct declaration of a routed payment was marked self-contradicting.
+  const USDC = '0xcebA9300f2b948710d2653dD7B07f33A8B32118C' as Address
+  const routed = {
+    ...settled(REVIEWER_A, STRANGER_1),
+    transfers: [
+      { token: USDC, symbol: 'USDC', decimals: 6, from: REVIEWER_A as Address, to: STRANGER_1 as Address, value: 1_000_000n },
+      { token: USDC, symbol: 'USDC', decimals: 6, from: STRANGER_1 as Address, to: AGENT_OWNER as Address, value: 990_000n },
+    ],
+  }
+  const m = matchParties({ check: routed, reviewer: REVIEWER_A, agentOwner: AGENT_OWNER, declaredFrom: REVIEWER_A, declaredTo: AGENT_OWNER })
+  assert.equal(m.declarationHonest, true)
+  assert.equal(m.contradicted, false)
 })
 
 check('a transaction that moved nothing cannot be attributed to anyone', () => {

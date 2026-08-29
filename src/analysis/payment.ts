@@ -201,6 +201,21 @@ export interface PartyMatch {
   attributed: boolean
   /** Some end provably belongs to somebody else. */
   contradicted: boolean
+  /**
+   * Value that attribution actually supports, bounded at BOTH ends.
+   *
+   * Publishing the transaction's largest transfer instead made the amount
+   * trivially inflatable: a reviewer sends 500 USDC to their own second address
+   * and one millionth of a dollar to the agent, in one transaction. Both ends
+   * of the attribution check pass, and the published amount is the 500 — so a
+   * consumer filtering on "attributed and at least 500 USDC" admits a review
+   * that paid the agent 0.000001. The bound is the smaller of what the reviewer
+   * sent and what the agent owner received, per token.
+   */
+  attributedAmount: bigint | null
+  attributedToken: Address | null
+  attributedSymbol: string | null
+  attributedDecimals: number | null
   note: string
 }
 
@@ -222,6 +237,10 @@ export function matchParties(params: {
     declarationHonest: null,
     attributed: false,
     contradicted: false,
+    attributedAmount: null,
+    attributedToken: null,
+    attributedSymbol: null,
+    attributedDecimals: null,
     note: 'no settlement transfer to attribute',
   }
   if (!check.exists || !check.succeeded || !check.movedValue) return none
@@ -249,9 +268,17 @@ export function matchParties(params: {
   const payerIsReviewer = legs.some((t) => same(t.from, reviewer))
   const payeeIsAgentOwner = agentOwner ? legs.some((t) => same(t.to, agentOwner)) : false
 
+  /**
+   * The declared parties are checked the same way the attribution is: end by
+   * end, across the whole transaction. Requiring both to appear on ONE leg
+   * convicted honest routing — a file correctly declaring payer and payee of a
+   * payment that reached the agent through an intermediary was marked as
+   * contradicting itself.
+   */
   const declarationHonest =
     declaredFrom || declaredTo
-      ? legs.some((t) => (!declaredFrom || same(t.from, declaredFrom)) && (!declaredTo || same(t.to, declaredTo)))
+      ? (!declaredFrom || legs.some((t) => same(t.from, declaredFrom))) &&
+        (!declaredTo || legs.some((t) => same(t.to, declaredTo)))
       : null
 
   const attributed = payerIsReviewer && payeeIsAgentOwner
@@ -274,6 +301,26 @@ export function matchParties(params: {
   const strangersOnly = agentOwner !== null && !payerIsReviewer && !payeeIsAgentOwner && legs.length > 0
   const contradicted = declarationHonest === false || strangersOnly
 
+  /**
+   * What attribution is worth, per token, bounded at both ends: never more than
+   * the reviewer sent, never more than the agent owner received. A leg between
+   * two addresses the reviewer controls raises neither bound.
+   */
+  let attributedAmount: bigint | null = null
+  let attributedLeg: TokenTransfer | null = null
+  if (attributed && agentOwner) {
+    for (const tok of new Set(legs.map((t) => t.token.toLowerCase()))) {
+      const ofToken = legs.filter((t) => t.token.toLowerCase() === tok)
+      const sent = ofToken.filter((t) => same(t.from, reviewer)).reduce((n, t) => n + t.value, 0n)
+      const received = ofToken.filter((t) => same(t.to, agentOwner)).reduce((n, t) => n + t.value, 0n)
+      const bounded = sent < received ? sent : received
+      if (attributedAmount === null || bounded > attributedAmount) {
+        attributedAmount = bounded
+        attributedLeg = ofToken[0] ?? null
+      }
+    }
+  }
+
   const parts: string[] = []
   parts.push(payerIsReviewer ? 'payer is the reviewer' : 'payer is not the reviewer')
   parts.push(
@@ -289,7 +336,18 @@ export function matchParties(params: {
   // so the money reached the agent by a route rather than directly.
   if (attributed && !direct) parts.push('attributed across separate legs, not one direct transfer')
 
-  return { payerIsReviewer, payeeIsAgentOwner, declarationHonest, attributed, contradicted, note: parts.join('; ') }
+  return {
+    payerIsReviewer,
+    payeeIsAgentOwner,
+    declarationHonest,
+    attributed,
+    contradicted,
+    attributedAmount,
+    attributedToken: attributedLeg?.token ?? null,
+    attributedSymbol: attributedLeg?.symbol ?? null,
+    attributedDecimals: attributedLeg?.decimals ?? null,
+    note: parts.join('; '),
+  }
 }
 
 /**
