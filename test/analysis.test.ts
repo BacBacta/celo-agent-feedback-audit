@@ -1004,4 +1004,40 @@ check('a claim nested under a null proof object does not throw', () => {
   assert.equal(extract2({ transactions: 42 }).txHash, null)
 })
 
+console.log('\nthe shipped build')
+
+const FS = await import('node:fs')
+
+check('every module the source imports is one the build actually ships', () => {
+  /**
+   * `npm run audit` is the production command, and it runs `dist/`, not `src/`.
+   * The build copies `.mjs` files by hand — TypeScript will not, they are not
+   * its inputs — so shipping `coverage.mjs` and forgetting the copy left the
+   * documented entry point unable to start at all: ERR_MODULE_NOT_FOUND on the
+   * first import, after a build that reported success. `npm test` runs the
+   * TypeScript sources directly and was green throughout.
+   */
+  const { readdirSync, readFileSync } = FS
+  const shipped = new Set(
+    readdirSync('src').filter((f: string) => f.endsWith('.mjs')),
+  )
+  assert.ok(shipped.size > 0, 'the hand-copied set should not be empty')
+
+  const pkg = JSON.parse(readFileSync('package.json', 'utf8'))
+  const build: string = pkg.scripts.build
+  assert.match(
+    build, /cp src\/\*\.mjs dist\//,
+    'the build must copy every src/*.mjs, not a hand-maintained list that drifts',
+  )
+
+  // And the imports themselves resolve to files that exist.
+  for (const f of readdirSync('src')) {
+    if (!f.endsWith('.ts') && !f.endsWith('.mjs')) continue
+    const src = readFileSync(`src/${f}`, 'utf8')
+    for (const m of src.matchAll(/from '\.\/([A-Za-z0-9._-]+\.mjs)'/g)) {
+      assert.ok(shipped.has(m[1]!), `src/${f} imports ${m[1]}, which src/ does not contain`)
+    }
+  }
+})
+
 console.log(`\n${passed} passed (full suite)\n`)
