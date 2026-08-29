@@ -1055,6 +1055,49 @@ await check('a plus sign in a data: URI is a plus sign', async () => {
   assert.equal((await FETCH.fetchEvidence('data:text/plain,a%20b')).text, 'a b')
 })
 
+console.log('\na proof we cannot read is not a silence')
+
+check('every shape proofOfPayment arrives in is read, and an unreadable one says so', () => {
+  /**
+   * `typeof [] === 'object'`, so an array passed the old object test and then
+   * had no `txHash` — the document read as declaring nothing. Downstream that
+   * becomes Payment.NotDeclared, an on-chain assertion in the reviewer's name
+   * that OVERWRITES an attributed payment. Our extractor's gap became their
+   * permanent record.
+   */
+  const H = '0x' + '11'.repeat(32)
+  const claim = (doc: unknown) => extractPaymentClaim(doc)
+
+  for (const [doc, nom] of [
+    [{ proofOfPayment: { txHash: H } }, 'object'],
+    [{ proofOfPayment: H }, 'bare string'],
+    [{ proofOfPayment: [{ txHash: H }] }, 'array of claims'],
+    [{ proofOfPayment: [H] }, 'array of hashes'],
+  ] as [unknown, string][]) {
+    const r = claim(doc)
+    assert.equal(r.txHash, H, `missed the claim in the ${nom} form`)
+    assert.equal(r.proofPresent, false)
+  }
+
+  // A field we cannot read is neither a claim nor a silence, and must say so.
+  for (const doc of [{ proofOfPayment: { note: 'paid' } }, { proofOfPayment: 'n/a' }]) {
+    const r = claim(doc)
+    assert.equal(r.txHash, null)
+    assert.equal(r.proofPresent, true, 'an unreadable proof must not read as absence')
+  }
+
+  // A placeholder is not a transaction hash: treating "n/a" as one would
+  // manufacture a PaymentTxNotFound out of nothing.
+  assert.equal(claim({ proofOfPayment: 'n/a' }).txHash, null)
+
+  // Real absence stays absence, so the honest NotDeclared is still reachable.
+  for (const doc of [{ proofOfPayment: null }, { rating: { score: 5 } }, { proofOfPayment: [] }]) {
+    const r = claim(doc)
+    assert.equal(r.txHash, null)
+    assert.equal(r.proofPresent, false)
+  }
+})
+
 console.log('\nthe verdict cache remembers which rules decided it')
 
 const FS = await import('node:fs')
@@ -1099,7 +1142,7 @@ await check('changing what a verdict means starts a new cache, it does not inher
   for (const f of DECIDERS) h.update(FS.readFileSync(f))
   const digest = h.digest('hex').slice(0, 16)
   assert.equal(
-    digest, '23cfb44eabb0c3fc',
+    digest, 'e86cbe6dc9f332af',
     `retrieval semantics changed (digest ${digest}). Bump RETRIEVAL_RULES ` +
       `(currently "${RETRIEVAL_RULES}") and update this digest, or cached verdicts ` +
       'decided under the old rules will be republished as a fresh measurement.',

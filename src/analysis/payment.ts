@@ -400,8 +400,23 @@ export function extractPaymentClaim(parsed: unknown): {
   declaredFrom: string | null
   declaredTo: string | null
   shape: string | null
+  /**
+   * The document carries a proof-of-payment field we could not turn into a
+   * claim.
+   *
+   * Downstream, "no claim" is written on chain as `Payment.NotDeclared` — an
+   * assertion that the reviewer's document names no payment, which OVERWRITES
+   * whatever was published before. An unrecognised shape is not that: it is
+   * our extractor falling short, and publishing it as the reviewer's silence
+   * turns our gap into their record. The backfill reads this column and stays
+   * quiet instead.
+   */
+  proofPresent: boolean
 } {
-  const EMPTY = { txHash: null, network: null, declaredFrom: null, declaredTo: null, shape: null }
+  const EMPTY = {
+    txHash: null, network: null, declaredFrom: null, declaredTo: null,
+    shape: null, proofPresent: false,
+  }
   // `JSON.parse` succeeds on `null`, `7` and `"text"` as readily as on an
   // object. Reading a property off the first of those throws, and the throw is
   // outside any handler, so one four-byte file used to end the entire run.
@@ -411,17 +426,51 @@ export function extractPaymentClaim(parsed: unknown): {
   const proof = doc.proofOfPayment ?? doc.proof_of_payment ?? null
   const txns = doc.transactions ?? null
   const obj = (v: unknown) => (v !== null && typeof v === 'object' ? (v as Record<string, any>) : null)
-  const p = obj(proof)
-  const t = obj(txns)
+
+  /**
+   * A claim is not always an object.
+   *
+   * `proofOfPayment` is written as a bare hash string by some publishers and
+   * as a list of claims by others. `typeof [] === 'object'`, so an array
+   * passed the old object test and then had no `txHash` — it read as a
+   * document declaring nothing, which is the strongest and most damaging of
+   * the three possible readings.
+   */
+  const HASHLIKE = /^0x[0-9a-fA-F]{40,}$/
+  const hashIn = (c: Record<string, any> | null) =>
+    c ? (c.txHash ?? c.payment_tx ?? c.paymentTx ?? c.tx_hash ?? null) : null
+  const asClaim = (v: unknown): Record<string, any> | null => {
+    if (v == null) return null
+    if (typeof v === 'string') {
+      const t = v.trim()
+      // A bare string is a claim only if it looks like an on-chain reference.
+      // Treating "none" or "n/a" as a transaction hash would manufacture a
+      // PaymentTxNotFound — a finding invented out of a placeholder.
+      return HASHLIKE.test(t) ? { txHash: t, _form: 'string' } : null
+    }
+    if (Array.isArray(v)) {
+      for (const el of v) {
+        const c = asClaim(el)
+        if (hashIn(c)) return { ...c, _form: 'array' }
+      }
+      return null
+    }
+    return obj(v)
+  }
+  const nonEmpty = (v: unknown) =>
+    v != null && !(typeof v === 'string' && v.trim() === '') && !(Array.isArray(v) && v.length === 0)
+  const p = asClaim(proof)
+  const t = asClaim(txns)
 
   const txHash =
     p?.txHash ?? p?.payment_tx ?? p?.paymentTx ?? p?.tx_hash ??
     t?.payment_tx ?? t?.paymentTx ?? null
 
+  const form = p?._form ? `.${p._form}` : ''
   const shape = p?.txHash
-    ? 'erc8004'
+    ? `erc8004${form}`
     : p?.payment_tx || p?.paymentTx
-      ? 'proof_of_payment.payment_tx'
+      ? `proof_of_payment.payment_tx${form}`
       : t?.payment_tx || t?.paymentTx
         ? 'transactions.payment_tx'
         : null
@@ -442,5 +491,7 @@ export function extractPaymentClaim(parsed: unknown): {
     declaredFrom: str(p?.fromAddress ?? p?.from_address ?? null),
     declaredTo: str(p?.toAddress ?? p?.to_address ?? obj(doc.rating)?.target_address ?? null),
     shape,
+    // A proof field is there, and nothing above turned it into a hash.
+    proofPresent: !txHash && (nonEmpty(proof) || nonEmpty(txns)),
   }
 }

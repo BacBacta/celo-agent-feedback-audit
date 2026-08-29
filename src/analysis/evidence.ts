@@ -25,6 +25,16 @@ export interface EvidenceVerdict {
   claimsPayment: boolean
   /** Which key shape the claim used, for reporting. */
   shape: string | null
+  /**
+   * A proof-of-payment field is present that we could not read as a claim.
+   *
+   * It is the difference between "this document names no payment" and "our
+   * extractor did not understand this document". The first is written on
+   * chain as Payment.NotDeclared and overwrites what was published before;
+   * the second is our gap, and publishing it as the reviewer's silence turns
+   * our shortfall into their permanent record.
+   */
+  proofPresent: boolean
   /** The claimed transaction exists on the chain the file names. */
   txExists: boolean
   /** It exists, succeeded, and moved a non-zero stablecoin amount. */
@@ -78,6 +88,7 @@ const EMPTY: EvidenceVerdict = {
   inconclusive: false,
   claimsPayment: false,
   shape: null,
+  proofPresent: false,
   txExists: false,
   paymentVerified: false,
   paymentAttributed: false,
@@ -199,7 +210,12 @@ export async function checkEvidence(
 
   const claim = extractPaymentClaim(parsed)
   if (!claim.txHash) {
-    return { ...withBody, jsonValid: true, note: 'no payment claim' }
+    return {
+      ...withBody,
+      jsonValid: true,
+      proofPresent: claim.proofPresent,
+      note: claim.proofPresent ? 'a proof field we could not read' : 'no payment claim',
+    }
   }
 
   const claimed = {

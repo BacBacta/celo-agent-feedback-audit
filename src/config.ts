@@ -206,7 +206,7 @@ export const QUERYABLE_CHAIN_IDS = new Set<string>(['42220', 'celo', 'celo-mainn
  * they are data, they are the most likely thing to change, and a different set
  * of gateways is a different measurement.
  */
-export const RETRIEVAL_RULES = 'r4-dotsegments-dataplus'
+export const RETRIEVAL_RULES = 'r5-proof-shapes'
 
 export function retrievalFingerprint(): string {
   const parts = [
