@@ -14,6 +14,10 @@ import { VerdictCache } from './verdict-cache.js'
 // service that consumes these rows. Two implementations of one format drift,
 // and this format's consumer writes to a public ledger.
 import { escapeCell as csvEsc } from './csv.mjs'
+// One implementation of the coverage tree, shared with the attestation
+// service. Three parties computing the same root from three implementations
+// is how a coverage claim quietly stops meaning anything.
+import { recordKey, merkleRoot } from './coverage.mjs'
 import { concentration, findBursts } from './analysis/concentration.js'
 import { reconcile, summarize } from './analysis/reconcile.js'
 import { renderMarkdown, renderJSON, collectEvidence, rung, evidenceRung, type AuditResult } from './report.js'
@@ -399,12 +403,23 @@ async function main() {
    * records this audit deliberately writes no verdict for. Taking it from the
    * CSV would make the claim agree with itself by construction.
    */
+  /**
+   * The root covers what was OBSERVED, never what was written.
+   *
+   * A root over the attested rows proves only what the events already prove —
+   * it cannot answer "was this record in scope and skipped", which is the one
+   * question the coverage claim exists for. So it is built here, by the only
+   * component that knows the observed set, and the writer merely carries it.
+   */
+  const observedKeys = feedback.map((f) => recordKey(f.agentId, f.reviewer, f.feedbackIndex))
+  writeFileSync('out/observed-keys.txt', [...new Set(observedKeys)].sort().join('\n') + '\n')
   writeFileSync(
     'out/sweep.json',
     JSON.stringify({
       fromBlock: fromBlock.toString(),
       toBlock: toBlock.toString(),
       observed: feedback.length,
+      observedRoot: merkleRoot(observedKeys),
       declaringEvidence: withPointer.length,
       exportedRows: evidenceRows.length,
       auditVersion: AUDIT_VERSION,

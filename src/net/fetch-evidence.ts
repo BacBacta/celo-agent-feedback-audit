@@ -1,5 +1,5 @@
 import { lookup } from 'node:dns/promises'
-import { Agent, fetch as undiciFetch } from 'undici'
+import { Agent, EnvHttpProxyAgent, fetch as undiciFetch } from 'undici'
 import { isIP } from 'node:net'
 import {
   EVIDENCE_MAX_BYTES,
@@ -196,6 +196,17 @@ const PROXY =
 
 export const PINNING_ACTIVE = !PROXY
 
+/**
+ * When a proxy is configured, route through it explicitly.
+ *
+ * Falling back to the GLOBAL fetch was worse than useless: Node's built-in
+ * fetch does not read HTTPS_PROXY at all, so that branch was neither pinned nor
+ * proxied — a direct connection resolving the name a second time, which is
+ * precisely the rebinding window this module claims to close. Every request now
+ * carries an explicit dispatcher: the proxy's, or the pinned one.
+ */
+const proxyDispatcher = PROXY ? new EnvHttpProxyAgent() : null
+
 export function pinningStatus(): string {
   return PINNING_ACTIVE
     ? 'address pinning: active — connections go to the address the guard checked'
@@ -235,7 +246,15 @@ export async function closeDispatchers(): Promise<void> {
  */
 async function readCapped(res: Response, maxBytes: number): Promise<Uint8Array | 'too-large'> {
   const declared = Number(res.headers.get('content-length') ?? NaN)
-  if (Number.isFinite(declared) && declared > maxBytes) return 'too-large'
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    // The body was never read, so it must be released here. Without this the
+    // socket is held past the deadline — fetchOnce's `finally` has already
+    // disarmed the AbortController — and a few hundred lying headers exhaust
+    // the file descriptors, after which every remaining record in the registry
+    // is published as "inconclusive" for a reason that is entirely ours.
+    await res.body?.cancel().catch(() => {})
+    return 'too-large'
+  }
   if (!res.body) return new Uint8Array()
 
   const reader = res.body.getReader()
@@ -295,12 +314,10 @@ async function fetchOnce(target: string, timeoutMs: number, maxBytes: number): P
         redirect: 'manual' as const,
         headers: { accept: 'application/json, text/plain;q=0.9, */*;q=0.5' },
       }
-      const res = PINNING_ACTIVE
-        ? ((await undiciFetch(url, {
-            ...init,
-            dispatcher: pinnedDispatcher(guard.address, guard.family),
-          })) as unknown as Response)
-        : await fetch(url, init)
+      const res = (await undiciFetch(url, {
+        ...init,
+        dispatcher: PINNING_ACTIVE ? pinnedDispatcher(guard.address, guard.family) : proxyDispatcher!,
+      })) as unknown as Response
 
       if (res.status >= 300 && res.status < 400) {
         const loc = res.headers.get('location')
@@ -410,6 +427,10 @@ export function cidFromGatewayUrl(url: string): { cid: string; ns: 'ipfs' | 'ipn
   const path = /^\/(ipfs|ipns)\/([^/?#]+)(\/.*)?$/i.exec(u.pathname)
   if (path && isCid(path[2]!)) {
     const rest = path[3] ?? ''
+    // `u.pathname` is already normalised by the URL parser, but the CID must
+    // still be the thing being asked for: a rest that climbs back out means the
+    // resource is not the one the identifier names.
+    if (hasDotSegments(rest)) return null
     return { cid: path[2]! + rest, ns: path[1]!.toLowerCase() as 'ipfs' | 'ipns' }
   }
   return null
@@ -424,6 +445,23 @@ export function cidFromGatewayUrl(url: string): { cid: string; ns: 'ipfs' | 'ipn
  * `HTTPS://` are valid and the first version of this code called them
  * unresolvable.
  */
+/**
+ * Segments a URL parser will collapse before the request is sent.
+ *
+ * `ipfs://<valid cid>/../../../admin` passes a CID check applied to the first
+ * segment and then asks four gateways for `/admin`: the bytes returned are not
+ * the ones the identifier names, and they are hashed, archived and published as
+ * that record's evidence. Verified at the wire: WHATWG-URL reduces the dot
+ * segments before the request line is emitted, and decodes percent-encoding one
+ * level, so both spellings must be refused here.
+ */
+function hasDotSegments(path: string): boolean {
+  const withSlashes = path.replace(/\\/g, '/')
+  let decoded: string
+  try { decoded = decodeURIComponent(withSlashes) } catch { return true }
+  return decoded.split('/').some((seg) => seg === '.' || seg === '..')
+}
+
 export function resolveTargets(uri: string): { targets: string[]; scheme: string } {
   const u = uri.trim()
   const lower = u.toLowerCase()
@@ -435,11 +473,15 @@ export function resolveTargets(uri: string): { targets: string[]; scheme: string
     // A scheme that promises content addressing, over something that is not a
     // content identifier, resolves nowhere for anybody.
     if (!isCid(cid)) return { targets: [], scheme: 'ipfs (not a CID)' }
+    // The CID is validated on the first segment but the WHOLE path is what gets
+    // appended to a gateway, so a traversal after it reaches another resource.
+    if (hasDotSegments(path)) return { targets: [], scheme: 'ipfs (path traversal)' }
     return { targets: IPFS_GATEWAYS.map((g) => `${g}${path}`), scheme: 'ipfs' }
   }
   if (lower.startsWith('ipns://')) {
     const path = u.slice('ipns://'.length)
     if (!path) return { targets: [], scheme: 'ipns (empty)' }
+    if (hasDotSegments(path)) return { targets: [], scheme: 'ipns (path traversal)' }
     return { targets: IPFS_GATEWAYS.map((g) => `${g.replace('/ipfs/', '/ipns/')}${path}`), scheme: 'ipns' }
   }
   if (lower.startsWith('ar://')) {

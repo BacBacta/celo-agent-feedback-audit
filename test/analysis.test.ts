@@ -612,6 +612,28 @@ check('an ordinary http URL is not mistaken for a gateway', () => {
   assert.equal(resolveTargets('https://example.test/a.json').targets.length, 1)
 })
 
+check('a traversal after a valid CID is refused, on every gateway', () => {
+  /**
+   * `ipfs://<valid cid>/../../../admin` passed a CID check applied to the first
+   * segment and then asked four gateways for `/admin` — bytes that are not the
+   * ones the identifier names, hashed, archived and published as that record's
+   * evidence. Verified at the wire: the URL parser collapses the dot segments
+   * before the request line is emitted, and decodes one level of percent
+   * encoding, so both spellings have to be refused here.
+   */
+  const CID = 'bafkreiedc46lhb6dv46cowbwz4nl6726a6zpcon6y6ejo64u6gyxjciyre'
+  for (const evil of ['/../../../admin/secret', '/%2e%2e/%2e%2e/admin', '/.%2e/admin', '/a/./../../x']) {
+    const { targets, scheme } = resolveTargets(`ipfs://${CID}${evil}`)
+    assert.equal(targets.length, 0, `${evil} reached ${targets.length} gateways`)
+    assert.match(scheme, /traversal/)
+  }
+  assert.equal(resolveTargets(`ipns://k51qexample/../etc`).targets.length, 0)
+  // A legitimate path under the CID is untouched.
+  assert.ok(resolveTargets(`ipfs://${CID}/dir/file.json`).targets.length > 1)
+  // And the gateway-URL path does not become a way back in.
+  assert.equal(FETCH.cidFromGatewayUrl(`https://ipfs.io/ipfs/${CID}/a/../../x`), null)
+})
+
 check('the pinning state is reported, never assumed', () => {
   /**
    * Behind an HTTP proxy the socket goes to the proxy and the proxy resolves
