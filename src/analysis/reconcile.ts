@@ -13,6 +13,14 @@ export interface ReconciledFeedback {
   selfDealing: boolean
   /** The reviewer holds a Self Agent ID. */
   humanBacked: boolean
+  /**
+   * The registry has no owner recorded for the agent this review is about.
+   *
+   * Attribution is impossible for these — there is no counterparty to match a
+   * settlement against — so counting them is what separates "we looked and
+   * found nothing" from "we could not look".
+   */
+  unresolvedAgent: boolean
 }
 
 /**
@@ -61,6 +69,9 @@ export function reconcile(params: {
         paidAfterReview: false,
         selfDealing: false,
         humanBacked: selfVerified.has(reviewer),
+        // No owner in the registry: attribution is not possible here, which is
+        // a different statement from "attribution was attempted and failed".
+        unresolvedAgent: true,
       }
     }
 
@@ -76,6 +87,7 @@ export function reconcile(params: {
       paidAfterReview: before.length === 0 && after.length > 0,
       selfDealing: reviewer === owner,
       humanBacked: selfVerified.has(reviewer),
+      unresolvedAgent: false,
     }
   })
 }
@@ -106,6 +118,13 @@ export function summarize(rows: ReconciledFeedback[]): ReconciliationStats {
     humanBacked,
     humanBackedRate: humanBacked / total,
     backedAndHumanBacked: rows.filter((r) => r.backingSettlement !== null && r.humanBacked).length,
-    unresolvedAgent: rows.filter((r) => r.backingSettlement === null && !r.paidAfterReview).length,
+    /**
+     * Documented as "feedback whose agent could not be resolved to an owner"
+     * and computed as "no backing settlement found and not paid afterwards" —
+     * a different question with a wildly different answer. It published 27,520
+     * (100%) where the true figure is 4 (0.0%), turning a near-complete
+     * ownership index into a headline about a broken one.
+     */
+    unresolvedAgent: rows.filter((r) => r.unresolvedAgent).length,
   }
 }

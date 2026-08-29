@@ -79,6 +79,7 @@ async function main() {
   // here because a platform commonly pays from a different address than the one
   // writing the review. The headline — whether a *declared* payment exists — is
   // verified per transaction hash and needs none of it.
+  let ranSettlements = false
   const skipSettlements = process.env.SKIP_SETTLEMENTS === '1'
   let settlements: Awaited<ReturnType<typeof loadSettlementsFrom>> = []
   if (skipSettlements) {
@@ -91,6 +92,7 @@ async function main() {
     )
   } else {
     settlements = await loadSettlementsFrom(reviewers, fromBlock, toBlock)
+    ranSettlements = true
   }
 
   console.log('\nAnalysing…')
@@ -224,6 +226,9 @@ async function main() {
   evidence.sampleStride = stride
   // Records beyond the fetch cap still declared a pointer.
   evidence.withPointer = withPointer.length
+  // Files this run actually wrote, as distinct from verdicts carrying a
+  // content id — a warm resume cache fills the second without fetching.
+  evidence.archivedThisRun = archive ? archive.size : 0
   evidence.declaresURI = withPointer.length
   evidence.declaresHash = feedback.filter((f) => f.hasHash).length
   evidence.hashWithoutURI = feedback.filter((f) => f.hasHash && !f.hasURI).length
@@ -242,6 +247,7 @@ async function main() {
     concentration: conc,
     bursts,
     settlementsSeen: settlements.length,
+    settlementsRan: ranSettlements,
     selfVerifiedReviewers: reviewers.filter((r) => selfVerified.has(r)).length,
   }
 
@@ -510,7 +516,8 @@ async function main() {
 
   console.log('\n' + '─'.repeat(60))
   console.log(`  feedback records            ${result.totalFeedback}`)
-  console.log(`  with a retrievable file     ${evidence.declaresURI}`)
+  console.log(`  declaring a file            ${evidence.declaresURI}`)
+  console.log(`  …of which retrieved         ${evidence.fetched}`)
   console.log(`  claiming a payment          ${evidence.claimsPayment}`)
   console.log(`  claimed tx exists on chain  ${evidence.txExists}`)
   console.log(`  payment actually verified   ${evidence.paymentVerified}`)

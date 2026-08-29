@@ -26,6 +26,16 @@ export interface AuditResult {
     foreignChain: number
     inconclusive: number
     archivedFiles: number
+    /**
+     * Files this run actually wrote to disk.
+     *
+     * `archivedFiles` counts verdicts carrying a content identifier, which a
+     * warm resume cache fills without fetching anything — so the sentence
+     * "N retrieved files were archived… every verdict stays checkable"
+     * described a corpus that could be empty, and on the last run was: 619
+     * claimed, 0 files on disk.
+     */
+    archivedThisRun: number
     sampled: number
     sampleStride: number
   }
@@ -33,6 +43,15 @@ export interface AuditResult {
   concentration: ConcentrationStats
   bursts: Burst[]
   settlementsSeen: number
+  /**
+   * Whether the sweep was actually attempted.
+   *
+   * `settlementsSeen === 0` cannot tell "we skipped this" from "we looked and
+   * there was nothing", and the report printed the first for both — so a real
+   * measurement of zero was published as a caveat saying no measurement had
+   * been made.
+   */
+  settlementsRan: boolean
   selfVerifiedReviewers: number
 }
 
@@ -76,7 +95,11 @@ ERC-8004 stores the evidence off-chain: the event carries a \`feedbackURI\` and 
 Each step below can fail independently, so the interesting result is where the
 chain breaks.
 
-| Step | Records | Share of all feedback |
+${
+  r.evidence.sampled < r.evidence.declaresURI
+    ? `> **Sampled, not complete.** ${num(r.evidence.sampled)} of ${num(r.evidence.declaresURI)} records that declare a file were opened — every ${r.evidence.sampleStride}th, evenly spread across the period rather than taken from one end. Every row below from "of which the file actually resolved" downwards is a count **within that sample**, while the percentages are of all feedback: read them as lower bounds. The ${num(r.evidence.declaresURI - r.evidence.sampled)} records that were not opened are exported with the rung \`NotChecked\` and nothing is attested for them.\n\n`
+    : ''
+}| Step | Records | Share of all feedback |
 |---|---|---|
 | Declares a \`feedbackURI\` | ${num(r.evidence.declaresURI)} | ${pct(r.evidence.declaresURI, t)} |
 | …of which the file actually resolved | ${num(r.evidence.fetched)} | ${pct(r.evidence.fetched, t)} |
@@ -95,18 +118,13 @@ chain breaks.
 > reasons that prove nothing — rate limits, timeouts, gateway outages. They are
 > excluded from the dead-link count above rather than folded into it. A file
 > this audit failed to reach is a question it failed to ask, not an answer.
-> ${num(r.evidence.archivedFiles)} retrieved files were archived content-addressed under
+> ${num(r.evidence.archivedFiles)} verdicts carry a content identifier, and ${num(r.evidence.archivedThisRun)} file(s) were written by THIS run under
 > \`out/evidence-corpus/\`, so every verdict above stays checkable after the
 > originals go offline.
 
-${
-  r.evidence.sampled < r.evidence.declaresURI
-    ? `> Sampled ${num(r.evidence.sampled)} of ${num(r.evidence.declaresURI)} records that declare a file — every ${r.evidence.sampleStride}th, evenly spread across the period rather than taken from one end. The four rows below are counts within that sample; the percentages are of all feedback, so read them as a lower bound.\n`
-    : ''
-}
-## Payment backing, reconstructed${r.settlementsSeen === 0 ? ' — not run' : ''}
+## Payment backing, reconstructed${r.settlementsRan === false ? ' — not run' : ''}
 
-${r.settlementsSeen === 0 ? '> The settlement sweep did not run for this window, so every figure in this section reads zero. It is not a finding. The headline above — whether a declared payment exists on chain — is verified per transaction hash and does not depend on it.\n' : ''}
+${r.settlementsRan === false ? '> The settlement sweep did not run for this window, so every figure in this section reads zero. It is not a finding. The headline above — whether a declared payment exists on chain — is verified per transaction hash and does not depend on it.\n' : ''}${r.settlementsRan === true && r.settlementsSeen === 0 ? '> The settlement sweep ran and found no transfers between these parties. That is a measurement, not an absence of one.\n' : ''}
 Independently of what a record declares, did this reviewer actually pay this
 agent's owner, in a stablecoin, before rating it?
 
@@ -188,6 +206,7 @@ export function collectEvidence(verdicts: EvidenceVerdict[], sampled: number) {
     // dead-link figure is how a transport problem becomes a published finding.
     inconclusive: verdicts.filter((v) => v.inconclusive).length,
     archivedFiles: verdicts.filter((v) => v.contentId !== null).length,
+    archivedThisRun: 0,
     sampled,
   }
 }

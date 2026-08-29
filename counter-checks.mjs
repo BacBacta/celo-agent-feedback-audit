@@ -49,13 +49,26 @@ for (const r of negatives) {
   // outside the inconclusive total, while the pipeline was publishing it as a
   // dead link — so a counter-check meant to expose the misclassification
   // reproduced it instead.
-  const cause = /HTTP 404|HTTP 410/.test(note) ? 'dead — host asserts absence'
+  /**
+   * OUR gateway failing is never a fact about THEIR file, and this test must
+   * be first.
+   *
+   * fetch-evidence wraps a gateway-level failure as
+   * `{ kind: 'inconclusive', note: 'gateway unusable: …' }` — deliberately, so
+   * one bad entry in our own list cannot condemn every ipfs:// record. But the
+   * inner note still says "refused private" or "malformed URL", so the ladder
+   * below matched it as an unusable URI and filed it OUTSIDE the inconclusive
+   * total. A counter-check written to expose exactly this misclassification
+   * was committing it.
+   */
+  const cause = /^gateway unusable:/.test(note) ? 'INCONCLUSIVE — our own gateway, not their file'
+    : /HTTP 404|HTTP 410/.test(note) ? 'dead — host asserts absence'
     : /unresolvable URI scheme/.test(note) ? 'unusable URI — no transport for this scheme'
     : /refused private|refused redirect|malformed URL|undecodable/.test(note) ? 'unusable URI — cannot be retrieved by anyone'
     : /oversize/.test(note) ? 'INCONCLUSIVE — body above the cap, never read'
     : /HTTP 4\d\d|HTTP 5\d\d/.test(note) ? 'INCONCLUSIVE — host refused or failed, not absence'
     : /429|timeout|inconclusive|fetch failed/.test(note) ? 'INCONCLUSIVE — proves nothing'
-    : /not checked/.test(note) ? 'INCONCLUSIVE — never attempted (sampling cap)'
+    : /not checked/.test(note) ? 'NOT ATTEMPTED — sampling cap; nothing is attested'
     : note
   byCause.set(cause, (byCause.get(cause) ?? 0) + 1)
 }
