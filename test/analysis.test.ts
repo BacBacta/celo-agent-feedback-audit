@@ -326,14 +326,15 @@ check('an unrecognised error stays unknown rather than being guessed at', () => 
 
 console.log('\nevidence sampling')
 
-// The bug this replaces: slice(0, n) on a block-ordered array samples only the
-// oldest cohort, which reported 0% payment claims for a period whose recent
-// half is 100%.
-function sample<T>(items: T[], max: number): T[] {
-  if (items.length <= max) return items
-  const stride = Math.ceil(items.length / max)
-  return items.filter((_, i) => i % stride === 0).slice(0, max)
-}
+/**
+ * The sampler the audit ACTUALLY runs.
+ *
+ * These four assertions used to exercise a copy of the function defined right
+ * here in the test file, while the real sampler was inline in main.ts and
+ * untested — so the bug they describe could have been reintroduced upstream
+ * without one of them noticing. It is a module now, imported by both.
+ */
+const { sample } = await import('../src/sample.mjs')
 
 check('a sample spans the whole range, not just its start', () => {
   const items = Array.from({ length: 6586 }, (_, i) => i)
@@ -1221,7 +1222,7 @@ await check('changing what a verdict means starts a new cache, it does not inher
   for (const f of DECIDERS) h.update(FS.readFileSync(f))
   const digest = h.digest('hex').slice(0, 16)
   assert.equal(
-    digest, '1a1bc7f12fe6128b',
+    digest, '5dd85b97909c182a',
     `retrieval semantics changed (digest ${digest}). Bump RETRIEVAL_RULES ` +
       `(currently "${RETRIEVAL_RULES}") and update this digest, or cached verdicts ` +
       'decided under the old rules will be republished as a fresh measurement.',
@@ -1253,11 +1254,24 @@ check('every module the source imports is one the build actually ships', () => {
   )
 
   // And the imports themselves resolve to files that exist.
-  for (const f of readdirSync('src')) {
-    if (!f.endsWith('.ts') && !f.endsWith('.mjs')) continue
-    const src = readFileSync(`src/${f}`, 'utf8')
-    for (const m of src.matchAll(/from '\.\/([A-Za-z0-9._-]+\.mjs)'/g)) {
-      assert.ok(shipped.has(m[1]!), `src/${f} imports ${m[1]}, which src/ does not contain`)
+  /**
+   * Every level of src/, not only the top one, and every relative spelling.
+   *
+   * The walk read `readdirSync('src')` and matched only `from './x.mjs'`, so a
+   * shared module imported from src/net/ or src/analysis/ as '../x.mjs' was
+   * invisible to a guard whose whole job is catching exactly that.
+   */
+  const walk = (dir: string): string[] =>
+    readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
+      e.isDirectory() ? walk(`${dir}/${e.name}`) : [`${dir}/${e.name}`])
+
+  const files = walk('src').filter((f) => f.endsWith('.ts') || f.endsWith('.mjs'))
+  assert.ok(files.length > 10, 'the walk found suspiciously few source files')
+  for (const f of files) {
+    const src = readFileSync(f, 'utf8')
+    for (const m of src.matchAll(/from '(\.{1,2}\/[A-Za-z0-9._/-]+\.mjs)'/g)) {
+      const name = m[1]!.split('/').pop()!
+      assert.ok(shipped.has(name), `${f} imports ${m[1]}, which src/ does not contain`)
     }
   }
 })

@@ -8,6 +8,7 @@ import { loadIdentity, loadSelfVerified } from './sources/identity.js'
 import { loadSettlementsFrom } from './sources/settlements.js'
 import { checkEvidence, type EvidenceVerdict } from './analysis/evidence.js'
 import { EvidenceArchive } from './archive.js'
+import { sample, sampleStride } from './sample.mjs'
 import { pinningStatus, closeDispatchers } from './net/fetch-evidence.js'
 import { VerdictCache } from './verdict-cache.js'
 // One escaper, shared with the offline tooling and with the attestation
@@ -115,12 +116,8 @@ async function main() {
   let toCheck: typeof withPointer = []
   let stride = 1
   if (maxFetches > 0) {
-    if (withPointer.length <= maxFetches) {
-      toCheck = withPointer
-    } else {
-      stride = Math.ceil(withPointer.length / maxFetches)
-      toCheck = withPointer.filter((_, i) => i % stride === 0).slice(0, maxFetches)
-    }
+    toCheck = sample(withPointer, maxFetches)
+    stride = sampleStride(withPointer.length, maxFetches)
   }
   console.log(
     `  ${withPointer.length} records declare evidence; checking ${toCheck.length}` +

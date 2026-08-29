@@ -115,11 +115,27 @@ export function escapeCell(val) {
     .replace(/\n/g, '\\n')
     .replace(/\t/g, '\\t')
     .replace(CONTROL_CHARS, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'))
+    /**
+     * Lone surrogates too, for the same reason and by a different route.
+     *
+     * They survived the escapes above unchanged, and then writeFileSync
+     * encodes UTF-8, which cannot represent them: Node substitutes U+FFFD
+     * silently. So the loss happened on the way to disk rather than here, and
+     * every unpaired surrogate in a file collapsed to the same replacement
+     * character — non-injective again, in the one field that is a join key.
+     */
+    .replace(LONE_SURROGATES, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'))
     .replace(/"/g, '""')}"`
 }
 
 /** Anything still unprintable after the named escapes above becomes \\uXXXX. */
 const CONTROL_CHARS = new RegExp('[\\u0000-\\u001f\\u007f]', 'g')
+
+/**
+ * A high or low surrogate that is not part of a valid pair. UTF-8 cannot
+ * encode one, so it must not reach the file unescaped.
+ */
+const LONE_SURROGATES = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g
 
 /**
  * Parse a CSV with a header row into objects.

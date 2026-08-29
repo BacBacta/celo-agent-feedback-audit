@@ -1,3 +1,4 @@
+import { networkInterfaces } from 'node:os'
 import { Resolver } from 'node:dns/promises'
 import { Agent, EnvHttpProxyAgent, fetch as undiciFetch } from 'undici'
 import { isIP } from 'node:net'
@@ -107,9 +108,39 @@ export function isPrivateAddress(ip: string): boolean {
   if (a === 192 && b === 168) return true
   if (a === 169 && b === 254) return true // link-local, and the cloud metadata endpoint
   if (a === 100 && b >= 64 && b <= 127) return true // carrier-grade NAT
+  /**
+   * The rest of RFC 6890's special-purpose blocks. None of them is a place a
+   * publisher's evidence can legitimately live, and several are reachable
+   * from inside a datacentre: 192.0.0.0/24 is IETF protocol assignments,
+   * 198.18.0.0/15 is benchmarking — a range some networks route internally —
+   * and the three documentation blocks are frequently squatted on by lab and
+   * staging environments.
+   */
+  if (a === 192 && b === 0 && p[2] === 0) return true // 192.0.0.0/24
+  if (a === 192 && b === 0 && p[2] === 2) return true // TEST-NET-1
+  if (a === 198 && b >= 18 && b <= 19) return true // benchmarking
+  if (a === 198 && b === 51 && p[2] === 100) return true // TEST-NET-2
+  if (a === 203 && b === 0 && p[2] === 113) return true // TEST-NET-3
   if (a >= 224) return true // multicast and reserved
+  /**
+   * And the machine running the audit.
+   *
+   * Its own non-loopback address is ordinary public space to every rule above,
+   * so a feedbackURI naming it reached whatever this host serves — a dev
+   * server, a metrics endpoint, an admin panel — and the bytes came back and
+   * were hashed and published as somebody's evidence. It is refused, and the
+   * list is read once because interfaces do not move mid-run.
+   */
+  if (OWN_ADDRESSES.has(ip)) return true
   return false
 }
+
+/** Every address this machine answers on, so a URI cannot name us. */
+const OWN_ADDRESSES = new Set<string>(
+  Object.values(networkInterfaces())
+    .flatMap((ifaces) => ifaces ?? [])
+    .map((i) => i.address),
+)
 
 /**
  * KNOWN LIMIT: this resolves the name, and then `fetch` resolves it again.
@@ -516,8 +547,16 @@ function readDataUri(uri: string, maxBytes: number): FetchOutcome {
      * compressed payload — was reported as an unusable URI, an accusation
      * about a document that was sitting right there in the string.
      */
+    /**
+     * Percent-decode first, then base64 — the order RFC 2397 and the WHATWG
+     * data-URL processor both specify. Feeding the RAW payload to a strict
+     * base64 test rejected any producer that had percent-encoded '=' (a
+     * reserved character it is entitled to escape) or '+' or '/', and the
+     * record was published as EvidenceUnreachable: an accusation built on our
+     * own decoder taking the steps in the wrong order.
+     */
     const bytes = /;base64$/i.test(meta)
-      ? decodeBase64Strict(payload)
+      ? decodeBase64Strict(new TextDecoder('utf-8').decode(percentDecodeToBytes(payload)))
       : percentDecodeToBytes(payload)
     if (bytes === null) return { kind: 'unusable', note: 'malformed base64 in data: URI' }
     if (bytes.byteLength > maxBytes) {
@@ -542,6 +581,14 @@ function readDataUri(uri: string, maxBytes: number): FetchOutcome {
  * invented. Recognising that costs nothing and turns six pointless requests and
  * an "inconclusive" into what it actually is: a finding about the record.
  */
+/**
+ * A CIDv1 carrying an identity multihash holds its data inline, so it is far
+ * shorter than the 32-byte-digest forms the length floors were calibrated for:
+ * `bafkqablimvwgy3y` is sixteen characters and resolves on every gateway.
+ * Refusing it published a valid, retrievable pointer as an invented filename.
+ */
+const IDENTITY_CIDV1 = /^(b[a-z2-7]{8,}|B[A-Z2-7]{8,}|f[0-9a-f]{16,}|F[0-9A-F]{16,})$/
+
 export function isCid(s: string): boolean {
   const v = s.trim()
   if (/^Qm[1-9A-HJ-NP-Za-km-z]{44}$/.test(v)) return true
@@ -552,6 +599,8 @@ export function isCid(s: string): boolean {
   if (/^K[0-9A-Z]{50,}$/.test(v)) return true // …and its uppercase form
   if (/^f[0-9a-f]{60,}$/.test(v)) return true // CIDv1, base16
   if (/^F[0-9A-F]{60,}$/.test(v)) return true
+  // Inline data instead of a 32-byte digest, so much shorter than the above.
+  if (IDENTITY_CIDV1.test(v) && !/^(feedback|file|doc|test)/i.test(v)) return true
   return false
 }
 
@@ -737,8 +786,16 @@ export async function fetchEvidence(
 
   for (let attempt = 0; attempt < attempts && !exhausted; attempt++) {
     for (const target of targets) {
-      if (Date.now() >= deadline) { exhausted = true; break }
-      const out = await fetchOnce(target, timeoutMs, maxBytes)
+      const left = deadline - Date.now()
+      if (left <= 0) { exhausted = true; break }
+      /**
+       * The deadline bounds the request it is about to START, not merely the
+       * decision to start it. A target entered with 1 ms of budget left was
+       * still handed the full EVIDENCE_TIMEOUT_MS, so the "ceiling on
+       * everything this record may cost" was routinely exceeded by a whole
+       * timeout — per pass, per target.
+       */
+      const out = await fetchOnce(target, Math.min(timeoutMs, left), maxBytes)
       if (out.kind === 'ok') return out
       /**
        * An unusable TARGET condemns the URI only when the target IS the URI.
