@@ -431,6 +431,16 @@ async function main() {
       declaringEvidence: withPointer.length,
       exportedRows: evidenceRows.length,
       auditVersion: AUDIT_VERSION,
+      /**
+       * The rules the verdicts behind this sweep were decided under.
+       *
+       * A coverage claim becomes an on-chain assertion, so it has to say what
+       * produced it. Without this the manifest names a version and a date and
+       * nothing about the retrieval semantics — which is how the previous run
+       * came to republish verdicts decided under rules that had since been
+       * corrected, and looked entirely legitimate doing it.
+       */
+      retrievalRules: rules,
       producedAt: new Date().toISOString(),
     }, null, 2),
   )
