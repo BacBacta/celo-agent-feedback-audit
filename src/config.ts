@@ -188,3 +188,44 @@ export const ARWEAVE_GATEWAYS = (process.env.ARWEAVE_GATEWAYS ?? [
  * finding we did not make.
  */
 export const QUERYABLE_CHAIN_IDS = new Set<string>(['42220', 'celo', 'celo-mainnet'])
+
+/**
+ * A fingerprint of the rules a retrieval verdict was decided under.
+ *
+ * The verdict cache is keyed by the registry's own tuple and nothing else, so
+ * a run under corrected retrieval rules replayed verdicts decided under the
+ * broken ones and published them as this run's measurement — a stale answer
+ * wearing a fresh date, which is the exact failure this audit accuses others
+ * of. Verdicts now live in a file named after the rules that produced them: a
+ * change starts a fresh cache rather than silently inheriting an old one, and
+ * re-running under the old rules still finds the old cache.
+ *
+ * `RETRIEVAL_RULES` is bumped by hand when the semantics of a verdict change —
+ * which is forgettable, so a test hashes the modules that decide one and fails
+ * if they moved without it. The gateway lists are folded in automatically:
+ * they are data, they are the most likely thing to change, and a different set
+ * of gateways is a different measurement.
+ */
+export const RETRIEVAL_RULES = 'r3-budget-multibase-datauri'
+
+export function retrievalFingerprint(): string {
+  const parts = [
+    RETRIEVAL_RULES,
+    AUDIT_VERSION,
+    `attempts=${EVIDENCE_ATTEMPTS}`,
+    `bytes=${EVIDENCE_MAX_BYTES}`,
+    `timeout=${EVIDENCE_TIMEOUT_MS}`,
+    `budget=${EVIDENCE_BUDGET_MS}`,
+    `redirects=${MAX_REDIRECTS}`,
+    `ipfs=${[...IPFS_GATEWAYS].sort().join('|')}`,
+    `ar=${[...ARWEAVE_GATEWAYS].sort().join('|')}`,
+  ].join(';')
+  // Short, stable, filename-safe: this names a cache file, it guards nothing.
+  let h1 = 0x811c9dc5
+  let h2 = 0x01000193
+  for (let i = 0; i < parts.length; i++) {
+    h1 = Math.imul(h1 ^ parts.charCodeAt(i), 0x01000193) >>> 0
+    h2 = Math.imul(h2 + parts.charCodeAt(i), 0x85ebca6b) >>> 0
+  }
+  return (h1.toString(36) + h2.toString(36)).slice(0, 12)
+}

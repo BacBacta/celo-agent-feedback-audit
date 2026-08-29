@@ -1,7 +1,7 @@
 import { mkdirSync, writeFileSync } from 'node:fs'
 import type { Address } from 'viem'
 import { latestBlock, assertDeterministicLogs } from './rpc.js'
-import { AUDIT_VERSION } from './config.js'
+import { AUDIT_VERSION, retrievalFingerprint } from './config.js'
 import { BLOCKS_PER_DAY, REGISTRY_DEPLOY_BLOCK, REPUTATION_REGISTRY, NEW_FEEDBACK_EVENT } from './config.js'
 import { loadFeedback } from './sources/feedback.js'
 import { loadIdentity, loadSelfVerified } from './sources/identity.js'
@@ -144,7 +144,10 @@ async function main() {
    * Retrieval resumes. It is the phase that takes hours, and until now a run
    * interrupted near the end repeated every fetch.
    */
-  const cache = new VerdictCache(`${process.env.CACHE_DIR ?? 'data'}/evidence-verdicts-${fromBlock}.jsonl`)
+  const rules = retrievalFingerprint()
+  const cache = new VerdictCache(
+    `${process.env.CACHE_DIR ?? 'data'}/evidence-verdicts-${fromBlock}-${rules}.jsonl`,
+  )
   const pending: typeof toCheck = []
   for (const rec of toCheck) {
     const hit = cache.get(VerdictCache.key(rec))
@@ -152,7 +155,12 @@ async function main() {
     else pending.push(rec)
   }
   if (cache.size) {
-    console.log(`  resuming: ${verdictByRecord.size} verdict(s) already decided, ${pending.length} to fetch`)
+    console.log(
+      `  resuming: ${verdictByRecord.size} verdict(s) already decided under rules ${rules}, ` +
+        `${pending.length} to fetch`,
+    )
+  } else {
+    console.log(`  retrieval rules ${rules} — no cached verdicts, every file will be fetched`)
   }
 
   const CONCURRENCY = 8

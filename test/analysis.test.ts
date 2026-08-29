@@ -1004,9 +1004,58 @@ check('a claim nested under a null proof object does not throw', () => {
   assert.equal(extract2({ transactions: 42 }).txHash, null)
 })
 
-console.log('\nthe shipped build')
+console.log('\nthe verdict cache remembers which rules decided it')
 
 const FS = await import('node:fs')
+
+await check('changing what a verdict means starts a new cache, it does not inherit the old', async () => {
+  /**
+   * The cache was keyed by the registry's own tuple and nothing else, so a run
+   * under corrected retrieval rules replayed verdicts decided under the broken
+   * ones and published them as its own measurement — a stale answer wearing a
+   * fresh date. That is precisely what this audit accuses the registry of, and
+   * it went unnoticed because the run reported success and the numbers looked
+   * plausible.
+   *
+   * The fingerprint names the cache file, so a change starts a fresh one
+   * rather than silently inheriting, and re-running under the old rules still
+   * finds the old cache. Bumping RETRIEVAL_RULES is manual, and manual is
+   * forgettable — so this test hashes the modules that decide a verdict and
+   * fails when they move without it.
+   */
+  const { retrievalFingerprint, RETRIEVAL_RULES, IPFS_GATEWAYS } = GATEWAYS
+  const fp = retrievalFingerprint()
+  assert.match(fp, /^[a-z0-9]{6,12}$/, 'the fingerprint names a file, so it must be filename-safe')
+
+  // Different gateways are a different measurement, and must not share a cache.
+  const saved = process.env.IPFS_GATEWAYS
+  process.env.IPFS_GATEWAYS = 'https://example.test/ipfs/'
+  const fresh = await import(`../src/config.js?rules=${encodeURIComponent(fp)}`)
+  assert.notEqual(fresh.retrievalFingerprint(), fp, 'a different gateway set must not reuse the cache')
+  if (saved === undefined) delete process.env.IPFS_GATEWAYS
+  else process.env.IPFS_GATEWAYS = saved
+  assert.ok(IPFS_GATEWAYS.length >= 2)
+
+  /**
+   * The digest below covers every module that can change what a verdict IS.
+   * If this fails, retrieval semantics moved: decide whether cached verdicts
+   * from before the change are still valid. Almost always they are not — bump
+   * RETRIEVAL_RULES and update this digest in the same commit.
+   */
+  const { createHash } = await import('node:crypto')
+  const DECIDERS = ['src/analysis/evidence.ts', 'src/analysis/payment.ts', 'src/net/fetch-evidence.ts']
+  const h = createHash('sha256')
+  for (const f of DECIDERS) h.update(FS.readFileSync(f))
+  const digest = h.digest('hex').slice(0, 16)
+  assert.equal(
+    digest, '247b7f423f227e4a',
+    `retrieval semantics changed (digest ${digest}). Bump RETRIEVAL_RULES ` +
+      `(currently "${RETRIEVAL_RULES}") and update this digest, or cached verdicts ` +
+      'decided under the old rules will be republished as a fresh measurement.',
+  )
+})
+
+console.log('\nthe shipped build')
 
 check('every module the source imports is one the build actually ships', () => {
   /**

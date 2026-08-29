@@ -1,0 +1,16 @@
+{
+  "type": "https://eips.ethereum.org/EIPS/eip-8004#feedback-v1",
+  "agentId": 9219,
+  "rating": 95,
+  "tag": "starred",
+  "comment": "OnFRA provides accurate Celo wallet financial health analysis, clear loan capacity guidance, and lender-ready explanations. Reliable agent APIs and well-structured ERC-8004 discovery metadata.",
+  "reviewer": "Wallet Profile",
+  "servicesUsed": [
+    "analyze_wallet",
+    "chat_query",
+    "generate_report",
+    "verify_report"
+  ],
+  "platform": "https://wallet-profile-orpin.vercel.app",
+  "reviewedAt": "2026-06-11"
+}
