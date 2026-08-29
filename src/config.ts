@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { parseAbiItem, type Address } from 'viem'
 
 /**
@@ -206,28 +207,53 @@ export const QUERYABLE_CHAIN_IDS = new Set<string>(['42220', 'celo', 'celo-mainn
  * they are data, they are the most likely thing to change, and a different set
  * of gateways is a different measurement.
  */
-export const RETRIEVAL_RULES = 'r6-cares-perurl-proxy'
+export const RETRIEVAL_RULES = 'r7-full-inputs'
 
+/**
+ * Everything that can change a verdict, hashed with a real hash.
+ *
+ * Three separate holes, all of them the same mistake — believing a shorter
+ * list was enough:
+ *
+ *   * The digest was a home-made pair of 32-bit mixes truncated to twelve
+ *     base36 characters. FNV-1a is invertible, so a meet-in-the-middle search
+ *     finds two different gateway lists with the same fingerprint — and the
+ *     fingerprint is what decides whether cached verdicts are reused. sha256
+ *     costs nothing here and is not a puzzle anyone can solve.
+ *
+ *   * The gateway lists were SORTED into the digest, so [slow, fast] and
+ *     [fast, slow] hashed identically. Order decides the verdict under the
+ *     wall-clock budget: fetchEvidence walks targets in order and checks the
+ *     deadline before each, so a slow gateway placed first can spend the
+ *     budget and leave the rest unasked. Order is an input; it is hashed.
+ *
+ *   * Only the retrieval settings were in it. A verdict also carries
+ *     txExists, paymentVerified, paymentAttributed, amounts and tokens, all
+ *     produced against CELO_RPC_URL — and the proxy decides both the network
+ *     path and whether address pinning happens at all. Each of those changes
+ *     what a verdict means, and none of them was named.
+ */
 export function retrievalFingerprint(): string {
   const parts = [
-    RETRIEVAL_RULES,
-    AUDIT_VERSION,
+    `rules=${RETRIEVAL_RULES}`,
+    `audit=${AUDIT_VERSION}`,
     `attempts=${EVIDENCE_ATTEMPTS}`,
     `bytes=${EVIDENCE_MAX_BYTES}`,
     `timeout=${EVIDENCE_TIMEOUT_MS}`,
     `budget=${EVIDENCE_BUDGET_MS}`,
+    `backoff=${EVIDENCE_RETRY_DELAY_MS}`,
+    `dns=${DNS_TIMEOUT_MS}`,
     `redirects=${MAX_REDIRECTS}`,
-    `ipfs=${[...IPFS_GATEWAYS].sort().join('|')}`,
-    `ar=${[...ARWEAVE_GATEWAYS].sort().join('|')}`,
+    // In order, not sorted: order is what the budget spends.
+    `ipfs=${IPFS_GATEWAYS.join('|')}`,
+    `ar=${ARWEAVE_GATEWAYS.join('|')}`,
+    // The payment half of every verdict comes from this endpoint.
+    `rpc=${process.env.CELO_RPC_URL ?? '(default)'}`,
+    // Proxy settings change the path AND disable address pinning.
+    `proxy=${['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'NO_PROXY', 'no_proxy']
+      .map((k) => `${k}=${(process.env[k] ?? '').trim()}`).join(',')}`,
   ].join(';')
-  // Short, stable, filename-safe: this names a cache file, it guards nothing.
-  let h1 = 0x811c9dc5
-  let h2 = 0x01000193
-  for (let i = 0; i < parts.length; i++) {
-    h1 = Math.imul(h1 ^ parts.charCodeAt(i), 0x01000193) >>> 0
-    h2 = Math.imul(h2 + parts.charCodeAt(i), 0x85ebca6b) >>> 0
-  }
-  return (h1.toString(36) + h2.toString(36)).slice(0, 12)
+  return createHash('sha256').update(parts).digest('hex').slice(0, 16)
 }
 
 /**

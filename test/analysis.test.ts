@@ -1162,7 +1162,34 @@ await check('changing what a verdict means starts a new cache, it does not inher
    */
   const { retrievalFingerprint, RETRIEVAL_RULES, IPFS_GATEWAYS } = GATEWAYS
   const fp = retrievalFingerprint()
-  assert.match(fp, /^[a-z0-9]{6,12}$/, 'the fingerprint names a file, so it must be filename-safe')
+  assert.match(fp, /^[0-9a-f]{16}$/, 'the fingerprint names a file, so it must be filename-safe')
+
+  /**
+   * Order is an input, not noise. The lists used to be sorted into the digest,
+   * so [slow, fast] and [fast, slow] hashed alike — while fetchEvidence walks
+   * targets in order and checks the wall-clock budget before each, so a slow
+   * gateway placed first can spend the budget and leave the rest unasked.
+   */
+  const savedOrder = process.env.IPFS_GATEWAYS
+  process.env.IPFS_GATEWAYS = 'https://a.test/ipfs/,https://b.test/ipfs/'
+  const one = (await import('../src/config.js?order=1')).retrievalFingerprint()
+  process.env.IPFS_GATEWAYS = 'https://b.test/ipfs/,https://a.test/ipfs/'
+  const two = (await import('../src/config.js?order=2')).retrievalFingerprint()
+  assert.notEqual(one, two, 'gateway ORDER decides verdicts under the budget')
+  if (savedOrder === undefined) delete process.env.IPFS_GATEWAYS
+  else process.env.IPFS_GATEWAYS = savedOrder
+
+  /**
+   * And the payment half of a verdict comes entirely from the RPC endpoint,
+   * while the proxy decides both the network path and whether address pinning
+   * happens at all. Neither was named in the digest.
+   */
+  const savedRpc = process.env.CELO_RPC_URL
+  process.env.CELO_RPC_URL = 'https://some-other-node.test'
+  const other = (await import('../src/config.js?rpc=1')).retrievalFingerprint()
+  assert.notEqual(other, fp, 'the endpoint that decides the payment half must be in the digest')
+  if (savedRpc === undefined) delete process.env.CELO_RPC_URL
+  else process.env.CELO_RPC_URL = savedRpc
 
   // Different gateways are a different measurement, and must not share a cache.
   const saved = process.env.IPFS_GATEWAYS
@@ -1180,12 +1207,21 @@ await check('changing what a verdict means starts a new cache, it does not inher
    * RETRIEVAL_RULES and update this digest in the same commit.
    */
   const { createHash } = await import('node:crypto')
-  const DECIDERS = ['src/analysis/evidence.ts', 'src/analysis/payment.ts', 'src/net/fetch-evidence.ts']
+  /**
+   * config.ts and rpc.ts belong here too. Adding a settlement token to the
+   * config, or changing which endpoint the payment half is verified against,
+   * changes what a verdict IS just as surely as editing the ladder does — and
+   * the guard that exists to catch exactly that was not looking at them.
+   */
+  const DECIDERS = [
+    'src/analysis/evidence.ts', 'src/analysis/payment.ts', 'src/net/fetch-evidence.ts',
+    'src/config.ts', 'src/rpc.ts',
+  ]
   const h = createHash('sha256')
   for (const f of DECIDERS) h.update(FS.readFileSync(f))
   const digest = h.digest('hex').slice(0, 16)
   assert.equal(
-    digest, 'a7f317e4c84c5a0d',
+    digest, '1a1bc7f12fe6128b',
     `retrieval semantics changed (digest ${digest}). Bump RETRIEVAL_RULES ` +
       `(currently "${RETRIEVAL_RULES}") and update this digest, or cached verdicts ` +
       'decided under the old rules will be republished as a fresh measurement.',

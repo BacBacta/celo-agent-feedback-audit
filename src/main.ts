@@ -144,9 +144,19 @@ async function main() {
    * Retrieval resumes. It is the phase that takes hours, and until now a run
    * interrupted near the end repeated every fetch.
    */
+  /**
+   * Named by the RULES alone, not by the block range.
+   *
+   * A verdict is about a record, and a record is the same record whatever
+   * window found it — so a per-range file was never separating anything the
+   * per-record keys inside do not separate already. It did break resume: with
+   * AUDIT_WINDOW set, fromBlock follows the chain head, which moves every
+   * second on Celo, so the file was newly named on every run and the retrieval
+   * phase — the one that takes hours — started from zero every time.
+   */
   const rules = retrievalFingerprint()
   const cache = new VerdictCache(
-    `${process.env.CACHE_DIR ?? 'data'}/evidence-verdicts-${fromBlock}-${rules}.jsonl`,
+    `${process.env.CACHE_DIR ?? 'data'}/evidence-verdicts-${rules}.jsonl`,
   )
   const pending: typeof toCheck = []
   for (const rec of toCheck) {
@@ -305,6 +315,20 @@ async function main() {
 
   const UNCHECKED_NOTE = 'not checked — beyond MAX_FILE_FETCHES sampling cap; nothing is attested for this record'
 
+  /**
+   * When THIS run looked at the registry, for rows decided from the event
+   * alone.
+   *
+   * A record that attested a hash and published no file needs no fetch: the
+   * event says it, and the verdict is EvidenceAbsent. But the row still went
+   * out with an empty observedAt, which the backfill reads as 0 and the
+   * contract stores as "not stated" — so the state on chain carried whatever
+   * date a PREVIOUS pass had left, describing a verdict this one had just
+   * replaced. A dimension that is stated must say when it was looked at, and
+   * for these rows the answer is: now, in this run, in the registry's own log.
+   */
+  const RUN_OBSERVED_AT = new Date().toISOString()
+
   writeFileSync(
     'out/evidence.csv',
     [
@@ -358,7 +382,9 @@ async function main() {
           v?.sha256 ?? '',
           v?.contentId ?? '',
           v?.bytes == null ? '' : String(v.bytes),
-          v?.observedAt ? new Date(v.observedAt * 1000).toISOString() : '',
+          v?.observedAt
+            ? new Date(v.observedAt * 1000).toISOString()
+            : unchecked ? '' : RUN_OBSERVED_AT,
           v?.via ?? '',
           unchecked ? UNCHECKED_NOTE : (v?.note ?? ''),
           v?.partyNote ?? '',

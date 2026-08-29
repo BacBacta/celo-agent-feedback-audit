@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { mkdirSync, existsSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs'
 import { createPublicClient, http, type AbiEvent, type Address } from 'viem'
 import { celo } from 'viem/chains'
@@ -229,8 +230,21 @@ const reviver = (_k: string, v: any) =>
 
 interface CacheState { completedUpTo: string }
 
+/**
+ * The endpoint is part of the cache key.
+ *
+ * The key was the block range alone, so a resume happily continued a scan
+ * another endpoint had started and republished its logs as this run's. That is
+ * not hypothetical here: this file documents forno answering 46, 40 and 37
+ * events over a range where the indexer answers 77, which is why the default
+ * moved. Mixing the two produces a log set no endpoint ever returned, and the
+ * coverage claim built on it counts records nobody can reproduce.
+ */
+const ENDPOINT_TAG = createHash('sha256').update(RPC_URL).digest('hex').slice(0, 8)
+
 function cachePaths(key: string) {
-  return { logs: `${CACHE_DIR}/${key}.jsonl`, state: `${CACHE_DIR}/${key}.state` }
+  const k = `${key}-${ENDPOINT_TAG}`
+  return { logs: `${CACHE_DIR}/${k}.jsonl`, state: `${CACHE_DIR}/${k}.state` }
 }
 
 /**

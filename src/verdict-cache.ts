@@ -1,4 +1,4 @@
-import { mkdirSync, existsSync, readFileSync, appendFileSync } from 'node:fs'
+import { mkdirSync, existsSync, readFileSync, appendFileSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import type { EvidenceVerdict } from './analysis/evidence.js'
 
@@ -25,7 +25,22 @@ export class VerdictCache {
     this.path = path
     mkdirSync(dirname(path), { recursive: true })
     if (!existsSync(path)) return
-    for (const line of readFileSync(path, 'utf8').split('\n')) {
+    /**
+     * Repair a line the last run was killed in the middle of.
+     *
+     * The file is opened in append mode, so a process killed inside
+     * appendFileSync leaves a line with no newline — and the NEXT run glued
+     * its first verdict onto that fragment, producing one invalid line that
+     * the silent catch below then threw away. Two verdicts lost, not one, and
+     * the comment promised at most one. Truncating the fragment up front makes
+     * the promise true.
+     */
+    const raw = readFileSync(path, 'utf8')
+    if (raw.length && !raw.endsWith('\n')) {
+      const keep = raw.lastIndexOf('\n')
+      writeFileSync(path, keep < 0 ? '' : raw.slice(0, keep + 1))
+    }
+    for (const line of raw.split('\n')) {
       if (!line.trim()) continue
       try {
         const { key, verdict } = JSON.parse(line)
