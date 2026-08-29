@@ -1004,6 +1004,57 @@ check('a claim nested under a null proof object does not throw', () => {
   assert.equal(extract2({ transactions: 42 }).txHash, null)
 })
 
+await check('a control character cannot smuggle a traversal past the guard', () => {
+  /**
+   * The hole was in `resolveTargets`, where the path is a RAW string glued to
+   * a gateway prefix and only parsed at request time. The URL parser strips
+   * TAB, LF and CR from the whole input BEFORE reducing dot segments, so a
+   * segment written ".<LF>." was never equal to ".." for a guard deciding on
+   * the raw string — and left as ".." for the parser. Measured: all three
+   * control-character spellings passed the old guard, and every one of them
+   * resolves to /ipfs/secrets, outside the CID entirely. Whatever came back
+   * would have been hashed and published as this record's evidence.
+   */
+  const CID = 'bafkreiedc46lhb6dv46cowbwz4nl6726a6zpcon6y6ejo64u6gyxjciyre'
+  for (const evil of ['/../secrets', '/.\n./secrets', '/.\t./secrets', '/.\r./secrets',
+                      '/%2e%2e/secrets', '/.%2E/secrets', '/%2E./secrets']) {
+    const r = resolveTargets(`ipfs://${CID}${evil}`)
+    assert.equal(r.targets.length, 0, `reached the network: ${JSON.stringify(evil)}`)
+    assert.match(r.scheme, /traversal/)
+    // And the URL layer really would have escaped the CID, which is why the
+    // raw-string guard had to match the parser's own rule rather than decode.
+    assert.ok(
+      !new URL(`https://g.test/ipfs/${CID}${evil}`).pathname.startsWith(`/ipfs/${CID}`),
+      `${JSON.stringify(evil)} does not actually escape — the test is wrong, not the code`,
+    )
+  }
+
+  /**
+   * The other half. A malformed escape made decodeURIComponent throw, and the
+   * catch published that record as an attempted traversal — an accusation
+   * against a publisher whose only crime was a percent sign in a filename.
+   */
+  assert.equal(resolveTargets(`ipfs://${CID}/a%zz.json`).targets.length > 0, true)
+  assert.deepEqual(FETCH.cidFromGatewayUrl(`https://ipfs.io/ipfs/${CID}/100%.json`), {
+    cid: `${CID}/100%.json`, ns: 'ipfs',
+  })
+})
+
+await check('a plus sign in a data: URI is a plus sign', async () => {
+  /**
+   * `+` meaning space is application/x-www-form-urlencoded, a form-submission
+   * convention with nothing to do with RFC 2397. Applying it here rewrote the
+   * publisher's bytes before they were hashed and archived, so the digest
+   * published on chain was of a document nobody wrote.
+   */
+  const plus = await FETCH.fetchEvidence('data:text/plain,a+b')
+  assert.equal(plus.text, 'a+b')
+  assert.deepEqual(Array.from(plus.bytes ?? []), [0x61, 0x2b, 0x62])
+  // Percent escapes still decode, including an encoded plus and a real space.
+  assert.equal((await FETCH.fetchEvidence('data:text/plain,a%2Bb')).text, 'a+b')
+  assert.equal((await FETCH.fetchEvidence('data:text/plain,a%20b')).text, 'a b')
+})
+
 console.log('\nthe verdict cache remembers which rules decided it')
 
 const FS = await import('node:fs')
@@ -1048,7 +1099,7 @@ await check('changing what a verdict means starts a new cache, it does not inher
   for (const f of DECIDERS) h.update(FS.readFileSync(f))
   const digest = h.digest('hex').slice(0, 16)
   assert.equal(
-    digest, '247b7f423f227e4a',
+    digest, '23cfb44eabb0c3fc',
     `retrieval semantics changed (digest ${digest}). Bump RETRIEVAL_RULES ` +
       `(currently "${RETRIEVAL_RULES}") and update this digest, or cached verdicts ` +
       'decided under the old rules will be republished as a fresh measurement.',

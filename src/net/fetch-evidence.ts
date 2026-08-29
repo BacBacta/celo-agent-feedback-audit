@@ -401,7 +401,15 @@ async function fetchOnce(target: string, timeoutMs: number, maxBytes: number): P
   }
 }
 
-/** Percent-decode to raw bytes; `%zz` and a trailing `%` are left as written. */
+/**
+ * Percent-decode to raw bytes; `%zz` and a trailing `%` are left as written.
+ *
+ * `+` is a literal 0x2B here, not a space. That substitution is
+ * application/x-www-form-urlencoded, a form-submission convention that has
+ * nothing to do with RFC 2397 — and applying it to a `data:` URI silently
+ * rewrote the publisher's bytes before they were hashed and archived, so the
+ * digest published on chain was of a document nobody wrote.
+ */
 function percentDecodeToBytes(s: string): Uint8Array {
   const out: number[] = []
   for (let i = 0; i < s.length; i++) {
@@ -409,8 +417,6 @@ function percentDecodeToBytes(s: string): Uint8Array {
     if (c === '%' && /^[0-9a-fA-F]{2}$/.test(s.slice(i + 1, i + 3))) {
       out.push(parseInt(s.slice(i + 1, i + 3), 16))
       i += 2
-    } else if (c === '+') {
-      out.push(0x20)
     } else {
       for (const b of new TextEncoder().encode(c)) out.push(b)
     }
@@ -548,11 +554,25 @@ export function cidFromGatewayUrl(url: string): { cid: string; ns: 'ipfs' | 'ipn
  * segments before the request line is emitted, and decodes percent-encoding one
  * level, so both spellings must be refused here.
  */
+/**
+ * Exactly the URL spec's single- and double-dot path segments.
+ *
+ * `decodeURIComponent` was both too weak and too strong. Too weak: the URL
+ * parser strips TAB, LF and CR from the whole input BEFORE it reduces dot
+ * segments, so a segment written ".<LF>." was never equal to ".." here and
+ * reached the gateway as one — a traversal that substituted the CID outright.
+ * Too strong: an ordinary filename carrying a malformed escape made it throw,
+ * and the `catch` published that record as an attempted path traversal against
+ * its own publisher.
+ *
+ * The spec names the four spellings, so match them and decode nothing.
+ */
+const SINGLE_DOT = /^(?:\.|%2e)$/i
+const DOUBLE_DOT = /^(?:\.\.|\.%2e|%2e\.|%2e%2e)$/i
+
 function hasDotSegments(path: string): boolean {
-  const withSlashes = path.replace(/\\/g, '/')
-  let decoded: string
-  try { decoded = decodeURIComponent(withSlashes) } catch { return true }
-  return decoded.split('/').some((seg) => seg === '.' || seg === '..')
+  const stripped = path.replace(/[\t\n\r]/g, '').replace(/\\/g, '/')
+  return stripped.split('/').some((seg) => SINGLE_DOT.test(seg) || DOUBLE_DOT.test(seg))
 }
 
 export function resolveTargets(uri: string): { targets: string[]; scheme: string } {
