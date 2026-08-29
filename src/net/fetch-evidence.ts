@@ -1,4 +1,5 @@
 import { lookup } from 'node:dns/promises'
+import { Agent, fetch as undiciFetch } from 'undici'
 import { isIP } from 'node:net'
 import {
   EVIDENCE_MAX_BYTES,
@@ -120,8 +121,12 @@ export function isPrivateAddress(ip: string): boolean {
  * than left to be discovered.
  */
 type Refusal = { kind: 'unusable' | 'inconclusive'; note: string }
+type Approved = { address: string; family: number }
+type GuardResult = Refusal | Approved
 
-async function guardHost(url: URL): Promise<Refusal | null> {
+const isRefusal = (g: GuardResult): g is Refusal => 'kind' in g
+
+async function guardHost(url: URL): Promise<GuardResult> {
   // `url.hostname` already excludes any userinfo and port, so the credentials
   // form (http://real-host@127.0.0.1/) is checked against 127.0.0.1, which is
   // the host that will actually be contacted.
@@ -130,7 +135,8 @@ async function guardHost(url: URL): Promise<Refusal | null> {
     return { kind: 'unusable', note: `refused private host ${host}` }
   }
   if (isIP(host)) {
-    return isPrivateAddress(host) ? { kind: 'unusable', note: `refused private address ${host}` } : null
+    if (isPrivateAddress(host)) return { kind: 'unusable', note: `refused private address ${host}` }
+    return { address: host, family: isIP(host) }
   }
   let addrs
   try {
@@ -150,7 +156,73 @@ async function guardHost(url: URL): Promise<Refusal | null> {
   }
   if (!addrs.length) return { kind: 'inconclusive', note: `cannot resolve ${host}` }
   const bad = addrs.find((a) => isPrivateAddress(a.address))
-  return bad ? { kind: 'unusable', note: `refused private address ${bad.address} for ${host}` } : null
+  if (bad) return { kind: 'unusable', note: `refused private address ${bad.address} for ${host}` }
+  // Hand back the address that was checked, so the connection can be pinned to
+  // it. Returning only "allowed" left the socket free to resolve the name a
+  // second time, which is the whole of the rebinding window.
+  const first = addrs[0]!
+  return { address: first.address, family: first.family }
+}
+
+/**
+ * Connect to the address the guard approved, not to whatever the name resolves
+ * to a moment later.
+ *
+ * The guard used to resolve a hostname, approve it, and then hand the URL to
+ * `fetch`, which resolved it again. Between those two lookups a record with a
+ * short TTL can change, so a host answering with a public address at check time
+ * could answer with 127.0.0.1 at connect time — the classic rebinding window,
+ * and the guard was decorative against anyone who ran a nameserver.
+ *
+ * Pinning closes it: the socket is given the exact address that was inspected.
+ * TLS still negotiates against the HOSTNAME, so SNI and certificate validation
+ * are untouched — an attacker gains nothing by pointing the name somewhere they
+ * hold no certificate for.
+ */
+const dispatchers = new Map<string, Agent>()
+
+/**
+ * Pinning is only meaningful on a direct connection.
+ *
+ * Behind an HTTP proxy the socket goes to the PROXY, and the proxy resolves the
+ * hostname itself — so there is no local address to pin, and the guard's own
+ * lookup is a pre-filter rather than the boundary. Saying that out loud matters
+ * more than the code: a deployment that believes rebinding is closed when the
+ * proxy is deciding where to connect holds a guarantee nobody gave it.
+ */
+const PROXY =
+  process.env.HTTPS_PROXY ?? process.env.https_proxy ??
+  process.env.HTTP_PROXY ?? process.env.http_proxy ?? null
+
+export const PINNING_ACTIVE = !PROXY
+
+export function pinningStatus(): string {
+  return PINNING_ACTIVE
+    ? 'address pinning: active — connections go to the address the guard checked'
+    : `address pinning: UNAVAILABLE — traffic goes through ${PROXY}, which resolves hostnames itself.` +
+      ' The SSRF guard is a local pre-filter here, not the boundary; the proxy is.'
+}
+
+function pinnedDispatcher(address: string, family: number): Agent {
+  const key = `${address}/${family}`
+  const hit = dispatchers.get(key)
+  if (hit) return hit
+  const agent = new Agent({
+    connect: {
+      lookup(_hostname: string, options: { all?: boolean }, cb: Function) {
+        if (options && options.all) cb(null, [{ address, family }])
+        else cb(null, address, family)
+      },
+    },
+  })
+  dispatchers.set(key, agent)
+  return agent
+}
+
+/** Release pooled sockets once a run is finished. */
+export async function closeDispatchers(): Promise<void> {
+  await Promise.all([...dispatchers.values()].map((a) => a.close().catch(() => {})))
+  dispatchers.clear()
 }
 
 /**
@@ -206,16 +278,29 @@ async function fetchOnce(target: string, timeoutMs: number, maxBytes: number): P
       if (!/^https?:$/i.test(parsed.protocol)) {
         return { kind: 'unusable', note: `refused redirect to ${parsed.protocol.replace(':', '')}` }
       }
-      const refusal = await guardHost(parsed)
-      if (refusal) return refusal.kind === 'unusable'
-        ? { kind: 'unusable', note: refusal.note }
-        : { kind: 'inconclusive', note: refusal.note, url }
+      const guard = await guardHost(parsed)
+      if (isRefusal(guard)) {
+        return guard.kind === 'unusable'
+          ? { kind: 'unusable', note: guard.note }
+          : { kind: 'inconclusive', note: guard.note, url }
+      }
 
-      const res = await fetch(url, {
+      /**
+       * undici's own fetch, not the global one, when pinning: a dispatcher from
+       * the userland package is rejected by Node's built-in fetch, which
+       * validates it against its own bundled copy of the class.
+       */
+      const init = {
         signal: ctrl.signal,
-        redirect: 'manual',
+        redirect: 'manual' as const,
         headers: { accept: 'application/json, text/plain;q=0.9, */*;q=0.5' },
-      })
+      }
+      const res = PINNING_ACTIVE
+        ? ((await undiciFetch(url, {
+            ...init,
+            dispatcher: pinnedDispatcher(guard.address, guard.family),
+          })) as unknown as Response)
+        : await fetch(url, init)
 
       if (res.status >= 300 && res.status < 400) {
         const loc = res.headers.get('location')
@@ -285,6 +370,52 @@ function readDataUri(uri: string, maxBytes: number): FetchOutcome {
 }
 
 /**
+ * Is this string a content identifier?
+ *
+ * CIDv0 is `Qm` followed by 44 base58 characters; CIDv1 in base32 is `b`
+ * followed by base32 lowercase. Anything else under an `ipfs://` scheme cannot
+ * resolve anywhere, for anyone — `ipfs://feedback-126-1771338626265` appears
+ * eleven times in this registry and is not a locator, it is a filename someone
+ * invented. Recognising that costs nothing and turns six pointless requests and
+ * an "inconclusive" into what it actually is: a finding about the record.
+ */
+export function isCid(s: string): boolean {
+  const v = s.trim()
+  if (/^Qm[1-9A-HJ-NP-Za-km-z]{44}$/.test(v)) return true
+  if (/^b[a-z2-7]{58,}$/.test(v)) return true // CIDv1, base32 lower
+  if (/^B[A-Z2-7]{58,}$/.test(v)) return true // CIDv1, base32 upper
+  if (/^[zZ][1-9A-HJ-NP-Za-km-z]{40,}$/.test(v)) return true // CIDv1, base58btc
+  return false
+}
+
+/**
+ * Pull a content identifier out of a URL that has a gateway baked into it.
+ *
+ * A publisher who wrote `http://ipfs.io/ipfs/<cid>` instead of `ipfs://<cid>`
+ * described the same immutable bytes and, until now, got a single attempt at a
+ * single host for it while the native form got three. The bytes are the same
+ * wherever they come from — that is what content addressing means — so the hash
+ * check stays valid no matter which gateway answers.
+ */
+export function cidFromGatewayUrl(url: string): { cid: string; ns: 'ipfs' | 'ipns' } | null {
+  let u: URL
+  try { u = new URL(url) } catch { return null }
+  if (!/^https?:$/i.test(u.protocol)) return null
+
+  // Subdomain gateways: https://<cid>.ipfs.dweb.link/
+  const sub = /^([a-z2-7]{58,})\.(ipfs|ipns)\./i.exec(u.hostname)
+  if (sub && isCid(sub[1]!)) return { cid: sub[1]!, ns: sub[2]!.toLowerCase() as 'ipfs' | 'ipns' }
+
+  // Path gateways: https://ipfs.io/ipfs/<cid>[/...]
+  const path = /^\/(ipfs|ipns)\/([^/?#]+)(\/.*)?$/i.exec(u.pathname)
+  if (path && isCid(path[2]!)) {
+    const rest = path[3] ?? ''
+    return { cid: path[2]! + rest, ns: path[1]!.toLowerCase() as 'ipfs' | 'ipns' }
+  }
+  return null
+}
+
+/**
  * Every URL worth trying for one URI, best first.
  *
  * Content-addressed schemes get one entry per gateway: a CID is the same bytes
@@ -300,10 +431,15 @@ export function resolveTargets(uri: string): { targets: string[]; scheme: string
 
   if (lower.startsWith('ipfs://')) {
     const path = u.slice('ipfs://'.length).replace(/^ipfs\//i, '')
+    const cid = path.split('/')[0] ?? ''
+    // A scheme that promises content addressing, over something that is not a
+    // content identifier, resolves nowhere for anybody.
+    if (!isCid(cid)) return { targets: [], scheme: 'ipfs (not a CID)' }
     return { targets: IPFS_GATEWAYS.map((g) => `${g}${path}`), scheme: 'ipfs' }
   }
   if (lower.startsWith('ipns://')) {
     const path = u.slice('ipns://'.length)
+    if (!path) return { targets: [], scheme: 'ipns (empty)' }
     return { targets: IPFS_GATEWAYS.map((g) => `${g.replace('/ipfs/', '/ipns/')}${path}`), scheme: 'ipns' }
   }
   if (lower.startsWith('ar://')) {
@@ -311,7 +447,21 @@ export function resolveTargets(uri: string): { targets: string[]; scheme: string
     return { targets: ARWEAVE_GATEWAYS.map((g) => `${g}${path}`), scheme: 'ar' }
   }
   if (lower.startsWith('data:')) return { targets: [u], scheme: 'data' }
-  if (lower.startsWith('http://') || lower.startsWith('https://')) return { targets: [u], scheme: 'http' }
+  if (lower.startsWith('http://') || lower.startsWith('https://')) {
+    /**
+     * A gateway baked into an http(s) URL still names immutable bytes. Try the
+     * publisher's own host first — it is the one they vouched for — then the
+     * same CID through ours, because a busy gateway is a fact about that
+     * gateway and never about the file.
+     */
+    const baked = cidFromGatewayUrl(u)
+    if (baked) {
+      const prefix = baked.ns === 'ipns' ? (g: string) => g.replace('/ipfs/', '/ipns/') : (g: string) => g
+      const fanned = IPFS_GATEWAYS.map((g) => `${prefix(g)}${baked.cid}`)
+      return { targets: [u, ...fanned.filter((t) => t !== u)], scheme: 'http+cid' }
+    }
+    return { targets: [u], scheme: 'http' }
+  }
   return { targets: [], scheme: lower.split(':')[0] ?? 'unknown' }
 }
 

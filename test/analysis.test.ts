@@ -475,7 +475,8 @@ import('../src/report.js').then(({ rung, evidenceRung, RUNG_ORDER }) => {
 
 console.log('\nSSRF guard')
 
-const { isPrivateAddress, resolveTargets } = await import('../src/net/fetch-evidence.js')
+const FETCH = await import('../src/net/fetch-evidence.js')
+const { isPrivateAddress, resolveTargets } = FETCH
 
 check('loopback, link-local and RFC1918 space are refused', () => {
   for (const ip of ['127.0.0.1', '10.0.0.5', '192.168.1.1', '172.16.0.1', '172.31.255.255',
@@ -527,16 +528,17 @@ const GATEWAYS = await import('../src/config.js')
 console.log('\nURI resolution')
 
 check('a content-addressed URI fans out across independent gateways', () => {
-  const { targets, scheme } = resolveTargets('ipfs://bafyfake')
+  const CID = 'bafkreiedc46lhb6dv46cowbwz4nl6726a6zpcon6y6ejo64u6gyxjciyre'
+  const { targets, scheme } = resolveTargets(`ipfs://${CID}`)
   assert.equal(scheme, 'ipfs')
   assert.ok(targets.length > 1, 'one gateway is not a measurement')
-  assert.ok(targets.every((t) => t.endsWith('bafyfake')))
+  assert.ok(targets.every((t) => t.endsWith(CID)))
 })
 
 check('scheme comparison is case-insensitive', () => {
   // `HTTPS://` and `IPFS://` are valid and were previously called unresolvable.
   assert.equal(resolveTargets('HTTPS://example.test/a.json').scheme, 'http')
-  assert.equal(resolveTargets('IPFS://bafyfake').scheme, 'ipfs')
+  assert.equal(resolveTargets('IPFS://bafkreiedc46lhb6dv46cowbwz4nl6726a6zpcon6y6ejo64u6gyxjciyre').scheme, 'ipfs')
 })
 
 check('Arweave and data URIs resolve instead of being written off', () => {
@@ -559,6 +561,69 @@ check('the gateway list contains no host that has stopped existing', () => {
     assert.match(g, /^https:\/\/[^/]+\//, `${g} should be an https gateway prefix`)
   }
   assert.ok(IPFS_GATEWAYS.length >= 2, 'one gateway is not a measurement')
+})
+
+check('a content identifier is recognised, an invented filename is not', () => {
+  const { isCid } = FETCH
+  assert.equal(isCid('QmVtej2KuZm2YhybAN2wTo7zPfPd2WwfMqPTfhmYefwcUm'), true, 'CIDv0')
+  assert.equal(isCid('bafkreiedc46lhb6dv46cowbwz4nl6726a6zpcon6y6ejo64u6gyxjciyre'), true, 'CIDv1 base32')
+  // Eleven records in this registry declare ipfs://feedback-126-<timestamp>.
+  // That is a filename someone invented, not a locator: it resolves nowhere,
+  // for anybody, and spending six requests to discover that is waste.
+  assert.equal(isCid('feedback-126-1771338626265'), false)
+  assert.equal(isCid(''), false)
+  assert.equal(isCid('Qmtooshort'), false)
+})
+
+check('ipfs:// over something that is not a CID is a finding, not a failure to reach', () => {
+  const { targets, scheme } = resolveTargets('ipfs://feedback-126-1771338626265')
+  assert.equal(targets.length, 0)
+  assert.match(scheme, /not a CID/)
+})
+
+check('a gateway baked into an http URL still gets the fan-out', () => {
+  /**
+   * A publisher who wrote http://ipfs.io/ipfs/<cid> named the same immutable
+   * bytes as ipfs://<cid> and used to get a single attempt at a single host for
+   * it. The bytes are identical wherever they come from, so the hash check
+   * stays valid — and their own host is tried first, because it is the one they
+   * vouched for.
+   */
+  const cid = 'bafkreihgeadqrcfosf4n4ghymyvqdzltzcrmqainpqm2butvf5ywbfyn4e'
+  const { targets, scheme } = resolveTargets(`http://ipfs.io/ipfs/${cid}`)
+  assert.equal(scheme, 'http+cid')
+  assert.ok(targets.length > 1, 'the fan-out must actually widen')
+  assert.equal(targets[0], `http://ipfs.io/ipfs/${cid}`, "the publisher's own host comes first")
+  assert.ok(targets.every((t) => t.includes(cid)), 'every target names the same CID')
+})
+
+check('a subdomain gateway is recognised too', () => {
+  const { cidFromGatewayUrl } = FETCH
+  const got = cidFromGatewayUrl('https://bafybeih7nqt2es23yu3vu55y42mil3wbi7vlof3culuftcxebepskolklq.ipfs.dweb.link/')
+  assert.equal(got?.ns, 'ipfs')
+  assert.match(got?.cid ?? '', /^bafybeih7nqt2es/)
+})
+
+check('an ordinary http URL is not mistaken for a gateway', () => {
+  const { cidFromGatewayUrl } = FETCH
+  assert.equal(cidFromGatewayUrl('https://miniapp-farcaster.vercel.app/.well-known/agent.json'), null)
+  // A path that looks the part but carries no CID must not be rewritten.
+  assert.equal(cidFromGatewayUrl('https://example.test/ipfs/not-a-cid'), null)
+  assert.equal(resolveTargets('https://example.test/a.json').targets.length, 1)
+})
+
+check('the pinning state is reported, never assumed', () => {
+  /**
+   * Behind an HTTP proxy the socket goes to the proxy and the proxy resolves
+   * the hostname, so there is no local address to pin and the guard is a
+   * pre-filter rather than the boundary. A deployment that believes rebinding
+   * is closed while a proxy decides the destination holds a guarantee nobody
+   * gave it, so the state is printed on every run.
+   */
+  const status = FETCH.pinningStatus()
+  assert.match(status, /address pinning: (active|UNAVAILABLE)/)
+  assert.equal(typeof FETCH.PINNING_ACTIVE, 'boolean')
+  if (!FETCH.PINNING_ACTIVE) assert.match(status, /pre-filter/)
 })
 
 check('a scheme with no transport is named, not silently dropped', () => {

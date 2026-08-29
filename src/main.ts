@@ -8,6 +8,7 @@ import { loadIdentity, loadSelfVerified } from './sources/identity.js'
 import { loadSettlementsFrom } from './sources/settlements.js'
 import { checkEvidence, type EvidenceVerdict } from './analysis/evidence.js'
 import { EvidenceArchive } from './archive.js'
+import { pinningStatus, closeDispatchers } from './net/fetch-evidence.js'
 import { VerdictCache } from './verdict-cache.js'
 // One escaper, shared with the offline tooling and with the attestation
 // service that consumes these rows. Two implementations of one format drift,
@@ -126,6 +127,7 @@ async function main() {
    * exactly what it condemns: a claim whose evidence is a dead link.
    */
   const archive = process.env.ARCHIVE_EVIDENCE === '0' ? null : new EvidenceArchive('out/evidence-corpus')
+  console.log(`  ${pinningStatus()}`)
 
   /**
    * Verdicts are paired with their record as they are produced. A positional
@@ -185,6 +187,7 @@ async function main() {
   if (toCheck.length) process.stdout.write('\n')
   if (failedChecks) console.log(`  ${failedChecks} check(s) threw and were dropped — see errors above`)
   if (archive) console.log(`  archived ${archive.size} distinct evidence files under out/evidence-corpus/`)
+  await closeDispatchers()
 
   const verdicts: EvidenceVerdict[] = [...verdictByRecord.values()]
 
