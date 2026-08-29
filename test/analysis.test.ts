@@ -625,7 +625,7 @@ check('a routed payment still attributes, and says it was routed', () => {
   }
   const m = matchParties({ check: routed, reviewer: REVIEWER_A, agentOwner: AGENT_OWNER, declaredFrom: null, declaredTo: null })
   assert.equal(m.attributed, true)
-  assert.match(m.note, /separate legs/)
+  assert.match(m.note, /through intermediaries/)
 })
 
 check('the attributed amount is bounded by what the agent actually received', () => {
@@ -685,6 +685,64 @@ check('a file honestly declaring a routed payment is not accused', () => {
   const m = matchParties({ check: routed, reviewer: REVIEWER_A, agentOwner: AGENT_OWNER, declaredFrom: REVIEWER_A, declaredTo: AGENT_OWNER })
   assert.equal(m.declarationHonest, true)
   assert.equal(m.contradicted, false)
+})
+
+const USDC_ADDR = '0xcebA9300f2b948710d2653dD7B07f33A8B32118C' as Address
+const leg = (from: string, to: string, value: bigint) =>
+  ({ token: USDC_ADDR, symbol: 'USDC', decimals: 6, from: from as Address, to: to as Address, value })
+
+check('two unconnected legs in one transaction are not a payment path', () => {
+  /**
+   * What checking the two ends independently allowed: the reviewer pays one
+   * address, an unrelated address pays the agent, and nothing joins them.
+   * "The reviewer paid someone" and "someone paid the agent" are both true; no
+   * value can have gone from one to the other.
+   */
+  const disconnected = {
+    ...settled(REVIEWER_A, AGENT_OWNER),
+    transfers: [leg(REVIEWER_A, STRANGER_1, 1_000_000n), leg(STRANGER_2, AGENT_OWNER, 1_000_000n)],
+  }
+  const m = matchParties({ check: disconnected, reviewer: REVIEWER_A, agentOwner: AGENT_OWNER, declaredFrom: null, declaredTo: null })
+  assert.equal(m.payerIsReviewer, true, 'the reviewer did pay someone')
+  assert.equal(m.payeeIsAgentOwner, true, 'and the agent was paid by someone')
+  assert.equal(m.attributed, false, 'but not by any path between them')
+  assert.match(m.note, /unconnected transfers/)
+})
+
+check('a connected path carrying dust is attributed for the dust, not for the decoy', () => {
+  /**
+   * The other half of the same attack, and the reason the amount is bounded
+   * rather than the rung refused. Here the legs DO connect, so a payment of one
+   * millionth of a dollar really did reach the agent — through addresses that
+   * also moved a thousand dollars between themselves. On chain that is
+   * indistinguishable from a genuine tiny routed payment, so the honest answer
+   * is to attribute it and publish what it was actually worth.
+   */
+  const decoy = {
+    ...settled(REVIEWER_A, AGENT_OWNER),
+    transfers: [
+      leg(STRANGER_1, STRANGER_2, 1_000_000_000n),
+      leg(REVIEWER_A, STRANGER_1, 1n),
+      leg(STRANGER_2, AGENT_OWNER, 1n),
+    ],
+  }
+  const m = matchParties({ check: decoy, reviewer: REVIEWER_A, agentOwner: AGENT_OWNER, declaredFrom: null, declaredTo: null })
+  assert.equal(m.attributed, true)
+  assert.equal(m.attributedAmount, 1n, 'the decoy leg backs nothing')
+})
+
+check('a genuine multi-hop route is still attributed, and bounded', () => {
+  const routed = {
+    ...settled(REVIEWER_A, STRANGER_1),
+    transfers: [
+      leg(REVIEWER_A, STRANGER_1, 1_000_000n),
+      leg(STRANGER_1, STRANGER_2, 995_000n),
+      leg(STRANGER_2, AGENT_OWNER, 990_000n),
+    ],
+  }
+  const m = matchParties({ check: routed, reviewer: REVIEWER_A, agentOwner: AGENT_OWNER, declaredFrom: null, declaredTo: null })
+  assert.equal(m.attributed, true)
+  assert.equal(m.attributedAmount, 990_000n)
 })
 
 check('a transaction that moved nothing cannot be attributed to anyone', () => {

@@ -269,6 +269,37 @@ export function matchParties(params: {
   const payeeIsAgentOwner = agentOwner ? legs.some((t) => same(t.to, agentOwner)) : false
 
   /**
+   * Attribution needs a PATH, not two facts that happen to be true in the same
+   * transaction.
+   *
+   * Checking "the reviewer paid someone" and "someone paid the agent"
+   * independently accepts a transaction the attacker composes entirely: one
+   * large transfer between two addresses they control, plus a dust leg out of
+   * the reviewer and a dust leg into the agent owner, with no connection
+   * between them. Both facts hold; no value went from the reviewer to the
+   * agent. Requiring the value to be traceable — directly, or through
+   * intermediaries that both receive from the reviewer's side and pay the
+   * agent's — is what makes the rung mean what it says.
+   */
+  function reaches(token: string): boolean {
+    const ofToken = legs.filter((t) => t.token.toLowerCase() === token)
+    // Addresses the reviewer's money demonstrably reached, transitively.
+    const reached = new Set<string>([reviewer.toLowerCase()])
+    for (let hop = 0; hop < ofToken.length; hop++) {
+      let grew = false
+      for (const t of ofToken) {
+        if (reached.has(t.from.toLowerCase()) && !reached.has(t.to.toLowerCase())) {
+          reached.add(t.to.toLowerCase())
+          grew = true
+        }
+      }
+      if (!grew) break
+    }
+    return agentOwner !== null && reached.has(agentOwner.toLowerCase())
+  }
+  const traceable = agentOwner !== null && [...new Set(legs.map((t) => t.token.toLowerCase()))].some(reaches)
+
+  /**
    * The declared parties are checked the same way the attribution is: end by
    * end, across the whole transaction. Requiring both to appear on ONE leg
    * convicted honest routing — a file correctly declaring payer and payee of a
@@ -281,7 +312,7 @@ export function matchParties(params: {
         (!declaredTo || legs.some((t) => same(t.to, declaredTo)))
       : null
 
-  const attributed = payerIsReviewer && payeeIsAgentOwner
+  const attributed = payerIsReviewer && payeeIsAgentOwner && traceable
 
   /**
    * "Contradicted" is deliberately narrow, and narrower than the first draft of
@@ -310,6 +341,7 @@ export function matchParties(params: {
   let attributedLeg: TokenTransfer | null = null
   if (attributed && agentOwner) {
     for (const tok of new Set(legs.map((t) => t.token.toLowerCase()))) {
+      if (!reaches(tok)) continue
       const ofToken = legs.filter((t) => t.token.toLowerCase() === tok)
       const sent = ofToken.filter((t) => same(t.from, reviewer)).reduce((n, t) => n + t.value, 0n)
       const received = ofToken.filter((t) => same(t.to, agentOwner)).reduce((n, t) => n + t.value, 0n)
@@ -334,7 +366,10 @@ export function matchParties(params: {
   if (strangersOnly) parts.push('settlement touches neither the reviewer nor the agent owner')
   // Worth recording: attribution held across two legs rather than one transfer,
   // so the money reached the agent by a route rather than directly.
-  if (attributed && !direct) parts.push('attributed across separate legs, not one direct transfer')
+  if (attributed && !direct) parts.push('attributed through intermediaries, not one direct transfer')
+  if (!attributed && payerIsReviewer && payeeIsAgentOwner && !traceable) {
+    parts.push('reviewer paid and agent was paid, but by unconnected transfers')
+  }
 
   return {
     payerIsReviewer,

@@ -44,12 +44,17 @@ for (const r of negatives) {
   const note = (r.note ?? '').trim() || '(no note)'
   // Group by cause, not by message: "HTTP 404" and "HTTP 410" are the same
   // kind of fact, and "429" and "timeout" are the same kind of non-fact.
-  const cause = /HTTP 404|HTTP 410|HTTP 451/.test(note) ? 'dead — host asserts absence'
-    : /HTTP 4\d\d/.test(note) ? 'refused — host declined to serve'
-    : /oversize/.test(note) ? 'oversize — body above the cap'
-    : /unresolvable URI scheme/.test(note) ? 'unresolvable — no transport for this scheme'
-    : /refused private/.test(note) ? 'refused — pointed inside our own network'
-    : /429|timeout|inconclusive|fetch failed|HTTP 5\d\d/.test(note) ? 'INCONCLUSIVE — proves nothing'
+  // The categories mirror the pipeline's own three-way split exactly. They
+  // diverged once — this tool filed a 403 under "host declined to serve",
+  // outside the inconclusive total, while the pipeline was publishing it as a
+  // dead link — so a counter-check meant to expose the misclassification
+  // reproduced it instead.
+  const cause = /HTTP 404|HTTP 410/.test(note) ? 'dead — host asserts absence'
+    : /unresolvable URI scheme/.test(note) ? 'unusable URI — no transport for this scheme'
+    : /refused private|refused redirect|malformed URL|undecodable/.test(note) ? 'unusable URI — cannot be retrieved by anyone'
+    : /oversize/.test(note) ? 'INCONCLUSIVE — body above the cap, never read'
+    : /HTTP 4\d\d|HTTP 5\d\d/.test(note) ? 'INCONCLUSIVE — host refused or failed, not absence'
+    : /429|timeout|inconclusive|fetch failed/.test(note) ? 'INCONCLUSIVE — proves nothing'
     : /not checked/.test(note) ? 'INCONCLUSIVE — never attempted (sampling cap)'
     : note
   byCause.set(cause, (byCause.get(cause) ?? 0) + 1)
