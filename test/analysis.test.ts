@@ -1055,6 +1055,49 @@ await check('a plus sign in a data: URI is a plus sign', async () => {
   assert.equal((await FETCH.fetchEvidence('data:text/plain,a%20b')).text, 'a b')
 })
 
+console.log('\npinning is decided per request, not per environment variable')
+
+await check('a request nothing will proxy is still pinned', async () => {
+  /**
+   * Pinning used to be switched off globally by the first non-null of four
+   * environment variables, and `??` only skips null and undefined. So an
+   * exported-but-empty HTTPS_PROXY="" disarmed pinning while proxying
+   * nothing: the request went out direct and resolved the name a second time,
+   * which is precisely the rebinding window this module exists to close.
+   *
+   * A proxy is also per-scheme and subject to NO_PROXY, so "is a proxy
+   * configured" was never the same question as "will THIS request be
+   * proxied" — and only the second one may decide whether to pin.
+   */
+  const saved = { ...process.env }
+  const load = async (env: Record<string, string | undefined>, tag: string) => {
+    for (const k of ['HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy', 'NO_PROXY', 'no_proxy']) {
+      delete process.env[k]
+    }
+    Object.assign(process.env, env)
+    return await import(`../src/net/fetch-evidence.js?proxy=${tag}`)
+  }
+
+  const empty = await load({ HTTPS_PROXY: '' }, 'empty')
+  assert.equal(empty.proxyFor(new URL('https://x.test/a')), null,
+    'an empty proxy variable must not disarm pinning')
+  assert.equal(empty.PINNING_ACTIVE, true)
+
+  const httpsOnly = await load({ HTTPS_PROXY: 'http://p.test:8080' }, 'https-only')
+  assert.equal(httpsOnly.proxyFor(new URL('https://x.test/a')), 'http://p.test:8080')
+  assert.equal(httpsOnly.proxyFor(new URL('http://x.test/a')), null,
+    'an http:// URL is not covered by HTTPS_PROXY, so it must still be pinned')
+
+  const excluded = await load(
+    { HTTPS_PROXY: 'http://p.test:8080', NO_PROXY: 'x.test,.internal.test' }, 'noproxy')
+  assert.equal(excluded.proxyFor(new URL('https://x.test/a')), null, 'NO_PROXY exact host')
+  assert.equal(excluded.proxyFor(new URL('https://a.internal.test/a')), null, 'NO_PROXY suffix')
+  assert.equal(excluded.proxyFor(new URL('https://other.test/a')), 'http://p.test:8080')
+
+  for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k]
+  Object.assign(process.env, saved)
+})
+
 console.log('\na proof we cannot read is not a silence')
 
 check('every shape proofOfPayment arrives in is read, and an unreadable one says so', () => {
@@ -1142,7 +1185,7 @@ await check('changing what a verdict means starts a new cache, it does not inher
   for (const f of DECIDERS) h.update(FS.readFileSync(f))
   const digest = h.digest('hex').slice(0, 16)
   assert.equal(
-    digest, 'e86cbe6dc9f332af',
+    digest, 'a7f317e4c84c5a0d',
     `retrieval semantics changed (digest ${digest}). Bump RETRIEVAL_RULES ` +
       `(currently "${RETRIEVAL_RULES}") and update this digest, or cached verdicts ` +
       'decided under the old rules will be republished as a fresh measurement.',

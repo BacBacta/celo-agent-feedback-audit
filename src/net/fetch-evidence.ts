@@ -1,4 +1,4 @@
-import { lookup } from 'node:dns/promises'
+import { Resolver } from 'node:dns/promises'
 import { Agent, EnvHttpProxyAgent, fetch as undiciFetch } from 'undici'
 import { isIP } from 'node:net'
 import {
@@ -10,6 +10,7 @@ import {
   IPFS_GATEWAYS,
   ARWEAVE_GATEWAYS,
   MAX_REDIRECTS,
+  DNS_TIMEOUT_MS,
 } from '../config.js'
 
 /**
@@ -127,6 +128,43 @@ type GuardResult = Refusal | Approved
 
 const isRefusal = (g: GuardResult): g is Refusal => 'kind' in g
 
+/**
+ * Resolve a name in a way the deadline can actually stop.
+ *
+ * `dns.lookup` runs getaddrinfo on the libuv threadpool — four threads by
+ * default — and takes no AbortSignal. Racing it against the deadline returned
+ * control to us on time and left the syscall running: the thread stayed
+ * occupied for as long as the resolver took. Eight records naming hosts with
+ * slow nameservers were enough to hold every thread in the pool, and every
+ * lookup after them queued behind those, so a handful of hostile records
+ * poisoned the rest of the run and each victim was published as
+ * `inconclusive`. The attacker bought the audit's time and paid nothing.
+ *
+ * `Resolver` is c-ares: it does its own socket I/O, never touches the
+ * threadpool, carries its own timeout, and `cancel()` really cancels. The one
+ * behavioural difference is that it does not consult /etc/hosts, which for a
+ * list of public gateways is no loss and is stated here rather than discovered.
+ */
+async function resolveAddresses(
+  host: string,
+  signal?: AbortSignal,
+): Promise<{ address: string; family: number }[]> {
+  const resolver = new Resolver({ timeout: DNS_TIMEOUT_MS, tries: 1 })
+  const onAbort = () => { try { resolver.cancel() } catch { /* already done */ } }
+  if (signal?.aborted) throw new Error('aborted')
+  signal?.addEventListener('abort', onAbort, { once: true })
+  try {
+    const [v4, v6] = await Promise.allSettled([resolver.resolve4(host), resolver.resolve6(host)])
+    const out: { address: string; family: number }[] = []
+    if (v4.status === 'fulfilled') for (const a of v4.value) out.push({ address: a, family: 4 })
+    if (v6.status === 'fulfilled') for (const a of v6.value) out.push({ address: a, family: 6 })
+    if (!out.length) throw new Error('no address')
+    return out
+  } finally {
+    signal?.removeEventListener('abort', onAbort)
+  }
+}
+
 async function guardHost(url: URL, signal?: AbortSignal): Promise<GuardResult> {
   // `url.hostname` already excludes any userinfo and port, so the credentials
   // form (http://real-host@127.0.0.1/) is checked against 127.0.0.1, which is
@@ -141,23 +179,7 @@ async function guardHost(url: URL, signal?: AbortSignal): Promise<GuardResult> {
   }
   let addrs
   try {
-    /**
-     * Race the lookup against the request's own deadline.
-     *
-     * `dns.lookup` takes no AbortSignal, so the timer armed around the fetch had
-     * no hold on it at all: a nameserver that never answers stalled here, before
-     * the deadline had anything to abort, and the comment promising the deadline
-     * covered the whole operation was simply wrong.
-     */
-    addrs = await (signal
-      ? Promise.race([
-          lookup(host, { all: true }),
-          new Promise<never>((_, reject) => {
-            if (signal.aborted) return reject(new Error('aborted'))
-            signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
-          }),
-        ])
-      : lookup(host, { all: true }))
+    addrs = await resolveAddresses(host, signal)
   } catch {
     /**
      * A name that does not resolve says nothing about the evidence.
@@ -207,11 +229,44 @@ const dispatchers = new Map<string, Agent>()
  * more than the code: a deployment that believes rebinding is closed when the
  * proxy is deciding where to connect holds a guarantee nobody gave it.
  */
-const PROXY =
-  process.env.HTTPS_PROXY ?? process.env.https_proxy ??
-  process.env.HTTP_PROXY ?? process.env.http_proxy ?? null
+/**
+ * Whether THIS request will be proxied — not whether a variable exists.
+ *
+ * Pinning used to be switched off globally by the first non-null of four
+ * environment variables, and that was wrong twice. `??` only skips null and
+ * undefined, so an exported-but-empty `HTTPS_PROXY=""` disarmed pinning while
+ * proxying nothing: the request went out direct, resolving the name a second
+ * time, which is exactly the rebinding window this module exists to close.
+ * And a proxy is per-scheme: with only HTTPS_PROXY set, an `http://` URL is
+ * never proxied, yet it lost its pinning all the same. NO_PROXY is the third
+ * spelling of the same hole.
+ */
+const envProxy = (...names: string[]): string | null => {
+  for (const n of names) {
+    const v = (process.env[n] ?? '').trim()
+    if (v) return v
+  }
+  return null
+}
+const HTTPS_PROXY = envProxy('HTTPS_PROXY', 'https_proxy')
+const HTTP_PROXY = envProxy('HTTP_PROXY', 'http_proxy')
+const NO_PROXY = (envProxy('NO_PROXY', 'no_proxy') ?? '')
+  .split(',').map((x) => x.trim().toLowerCase()).filter(Boolean)
 
-export const PINNING_ACTIVE = !PROXY
+/** Does NO_PROXY exempt this host, so the request goes out direct after all? */
+function noProxyCovers(host: string): boolean {
+  const h = host.toLowerCase()
+  return NO_PROXY.some((e) => e === '*' || h === e || h === e.replace(/^\./, '') || h.endsWith(e.startsWith('.') ? e : `.${e}`))
+}
+
+/** The proxy this exact URL would go through, or null if it goes out direct. */
+export function proxyFor(url: URL): string | null {
+  if (noProxyCovers(url.hostname)) return null
+  return url.protocol === 'https:' ? HTTPS_PROXY : HTTP_PROXY
+}
+
+/** Is any proxy configured at all? Reporting only — never a per-request test. */
+export const PINNING_ACTIVE = !HTTPS_PROXY && !HTTP_PROXY
 
 /**
  * When a proxy is configured, route through it explicitly.
@@ -222,12 +277,12 @@ export const PINNING_ACTIVE = !PROXY
  * precisely the rebinding window this module claims to close. Every request now
  * carries an explicit dispatcher: the proxy's, or the pinned one.
  */
-const proxyDispatcher = PROXY ? new EnvHttpProxyAgent() : null
+const proxyDispatcher = HTTPS_PROXY || HTTP_PROXY ? new EnvHttpProxyAgent() : null
 
 export function pinningStatus(): string {
   return PINNING_ACTIVE
     ? 'address pinning: active — connections go to the address the guard checked'
-    : `address pinning: UNAVAILABLE — traffic goes through ${PROXY}, which resolves hostnames itself.` +
+    : `address pinning: UNAVAILABLE — traffic goes through ${HTTPS_PROXY ?? HTTP_PROXY}, which resolves hostnames itself.` +
       ' The SSRF guard is a local pre-filter here, not the boundary; the proxy is.'
 }
 
@@ -353,7 +408,11 @@ async function fetchOnce(target: string, timeoutMs: number, maxBytes: number): P
       }
       const res = (await undiciFetch(url, {
         ...init,
-        dispatcher: PINNING_ACTIVE ? pinnedDispatcher(guard.address, guard.family) : proxyDispatcher!,
+        // Per URL, never globally: a request nothing will proxy must still be
+        // pinned to the address the guard approved.
+        dispatcher: proxyFor(parsed) && proxyDispatcher
+          ? proxyDispatcher
+          : pinnedDispatcher(guard.address, guard.family),
       })) as unknown as Response
 
       if (res.status >= 300 && res.status < 400) {

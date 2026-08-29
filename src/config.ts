@@ -206,7 +206,7 @@ export const QUERYABLE_CHAIN_IDS = new Set<string>(['42220', 'celo', 'celo-mainn
  * they are data, they are the most likely thing to change, and a different set
  * of gateways is a different measurement.
  */
-export const RETRIEVAL_RULES = 'r5-proof-shapes'
+export const RETRIEVAL_RULES = 'r6-cares-perurl-proxy'
 
 export function retrievalFingerprint(): string {
   const parts = [
@@ -229,3 +229,12 @@ export function retrievalFingerprint(): string {
   }
   return (h1.toString(36) + h2.toString(36)).slice(0, 12)
 }
+
+/**
+ * How long one name resolution may take.
+ *
+ * Its own budget rather than the request timeout: c-ares self-bounds and is
+ * cancellable, but a resolver that never answers should still cost less than a
+ * whole request's deadline, because a record can need several of them.
+ */
+export const DNS_TIMEOUT_MS = envNumber('DNS_TIMEOUT_MS', 4_000)
