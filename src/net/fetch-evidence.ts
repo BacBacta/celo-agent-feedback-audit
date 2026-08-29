@@ -6,6 +6,7 @@ import {
   EVIDENCE_TIMEOUT_MS,
   EVIDENCE_ATTEMPTS,
   EVIDENCE_RETRY_DELAY_MS,
+  EVIDENCE_BUDGET_MS,
   IPFS_GATEWAYS,
   ARWEAVE_GATEWAYS,
   MAX_REDIRECTS,
@@ -126,7 +127,7 @@ type GuardResult = Refusal | Approved
 
 const isRefusal = (g: GuardResult): g is Refusal => 'kind' in g
 
-async function guardHost(url: URL): Promise<GuardResult> {
+async function guardHost(url: URL, signal?: AbortSignal): Promise<GuardResult> {
   // `url.hostname` already excludes any userinfo and port, so the credentials
   // form (http://real-host@127.0.0.1/) is checked against 127.0.0.1, which is
   // the host that will actually be contacted.
@@ -140,7 +141,23 @@ async function guardHost(url: URL): Promise<GuardResult> {
   }
   let addrs
   try {
-    addrs = await lookup(host, { all: true })
+    /**
+     * Race the lookup against the request's own deadline.
+     *
+     * `dns.lookup` takes no AbortSignal, so the timer armed around the fetch had
+     * no hold on it at all: a nameserver that never answers stalled here, before
+     * the deadline had anything to abort, and the comment promising the deadline
+     * covered the whole operation was simply wrong.
+     */
+    addrs = await (signal
+      ? Promise.race([
+          lookup(host, { all: true }),
+          new Promise<never>((_, reject) => {
+            if (signal.aborted) return reject(new Error('aborted'))
+            signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+          }),
+        ])
+      : lookup(host, { all: true }))
   } catch {
     /**
      * A name that does not resolve says nothing about the evidence.
@@ -214,10 +231,30 @@ export function pinningStatus(): string {
       ' The SSRF guard is a local pre-filter here, not the boundary; the proxy is.'
 }
 
+/**
+ * Enough for the concurrency in flight, many times over. The map is keyed by an
+ * address the party being audited chooses, so without a ceiling a registry full
+ * of distinct hosts holds a connection pool per host for the whole run.
+ */
+const MAX_PINNED_DISPATCHERS = 64
+
 function pinnedDispatcher(address: string, family: number): Agent {
   const key = `${address}/${family}`
   const hit = dispatchers.get(key)
-  if (hit) return hit
+  if (hit) {
+    // Refresh recency: a Map keeps insertion order, so re-inserting makes the
+    // eviction below least-recently-used rather than first-created.
+    dispatchers.delete(key)
+    dispatchers.set(key, hit)
+    return hit
+  }
+  while (dispatchers.size >= MAX_PINNED_DISPATCHERS) {
+    const oldest = dispatchers.keys().next().value as string | undefined
+    if (oldest === undefined) break
+    const evicted = dispatchers.get(oldest)
+    dispatchers.delete(oldest)
+    void evicted?.close().catch(() => {})
+  }
   const agent = new Agent({
     connect: {
       lookup(_hostname: string, options: { all?: boolean }, cb: Function) {
@@ -297,7 +334,7 @@ async function fetchOnce(target: string, timeoutMs: number, maxBytes: number): P
       if (!/^https?:$/i.test(parsed.protocol)) {
         return { kind: 'unusable', note: `refused redirect to ${parsed.protocol.replace(':', '')}` }
       }
-      const guard = await guardHost(parsed)
+      const guard = await guardHost(parsed, ctrl.signal)
       if (isRefusal(guard)) {
         return guard.kind === 'unusable'
           ? { kind: 'unusable', note: guard.note }
@@ -364,6 +401,41 @@ async function fetchOnce(target: string, timeoutMs: number, maxBytes: number): P
   }
 }
 
+/** Percent-decode to raw bytes; `%zz` and a trailing `%` are left as written. */
+function percentDecodeToBytes(s: string): Uint8Array {
+  const out: number[] = []
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]!
+    if (c === '%' && /^[0-9a-fA-F]{2}$/.test(s.slice(i + 1, i + 3))) {
+      out.push(parseInt(s.slice(i + 1, i + 3), 16))
+      i += 2
+    } else if (c === '+') {
+      out.push(0x20)
+    } else {
+      for (const b of new TextEncoder().encode(c)) out.push(b)
+    }
+  }
+  return new Uint8Array(out)
+}
+
+/**
+ * Base64 that refuses what it cannot read.
+ *
+ * `Buffer.from(x, 'base64')` never throws: it silently drops anything outside
+ * the alphabet, so a corrupt payload came back as short bytes and was published
+ * as evidence that was successfully retrieved — hashed and archived under a
+ * digest of something nobody wrote.
+ */
+function decodeBase64Strict(payload: string): Uint8Array | null {
+  const clean = payload.replace(/\s/g, '')
+  if (!/^[A-Za-z0-9+/_-]*={0,2}$/.test(clean)) return null
+  const bytes = new Uint8Array(Buffer.from(clean, 'base64'))
+  // A round trip catches the silent truncation the decoder will not report.
+  const back = Buffer.from(bytes).toString('base64').replace(/=+$/, '')
+  if (back !== clean.replace(/[-_]/g, (m) => (m === '-' ? '+' : '/')).replace(/=+$/, '')) return null
+  return bytes
+}
+
 /** Percent/base64 payloads carried in the URI itself — no network, always live. */
 function readDataUri(uri: string, maxBytes: number): FetchOutcome {
   const m = /^data:([^,]*),([\s\S]*)$/i.exec(uri)
@@ -371,9 +443,18 @@ function readDataUri(uri: string, maxBytes: number): FetchOutcome {
   const meta = m[1] ?? ''
   const payload = m[2] ?? ''
   try {
+    /**
+     * Percent-decoding to BYTES, not through `decodeURIComponent`.
+     *
+     * That function is a text decoder: it throws on any percent sequence that
+     * is not valid UTF-8, so a `data:` URI carrying binary — an image, a
+     * compressed payload — was reported as an unusable URI, an accusation
+     * about a document that was sitting right there in the string.
+     */
     const bytes = /;base64$/i.test(meta)
-      ? new Uint8Array(Buffer.from(payload, 'base64'))
-      : new TextEncoder().encode(decodeURIComponent(payload))
+      ? decodeBase64Strict(payload)
+      : percentDecodeToBytes(payload)
+    if (bytes === null) return { kind: 'unusable', note: 'malformed base64 in data: URI' }
     if (bytes.byteLength > maxBytes) {
       return { kind: 'inconclusive', note: `oversize body (over ${maxBytes} bytes)`, url: 'data:' }
     }
@@ -402,6 +483,10 @@ export function isCid(s: string): boolean {
   if (/^b[a-z2-7]{58,}$/.test(v)) return true // CIDv1, base32 lower
   if (/^B[A-Z2-7]{58,}$/.test(v)) return true // CIDv1, base32 upper
   if (/^[zZ][1-9A-HJ-NP-Za-km-z]{40,}$/.test(v)) return true // CIDv1, base58btc
+  if (/^k[0-9a-z]{50,}$/.test(v)) return true // CIDv1, base36 — the usual IPNS spelling
+  if (/^K[0-9A-Z]{50,}$/.test(v)) return true // …and its uppercase form
+  if (/^f[0-9a-f]{60,}$/.test(v)) return true // CIDv1, base16
+  if (/^F[0-9A-F]{60,}$/.test(v)) return true
   return false
 }
 
@@ -421,7 +506,15 @@ export function cidFromGatewayUrl(url: string): { cid: string; ns: 'ipfs' | 'ipn
 
   // Subdomain gateways: https://<cid>.ipfs.dweb.link/
   const sub = /^([a-z2-7]{58,})\.(ipfs|ipns)\./i.exec(u.hostname)
-  if (sub && isCid(sub[1]!)) return { cid: sub[1]!, ns: sub[2]!.toLowerCase() as 'ipfs' | 'ipns' }
+  if (sub && isCid(sub[1]!)) {
+    // The path is part of what was asked for. Dropping it — which the path
+    // branch below never did — sent the fan-out after the CID's root instead of
+    // the file, and whatever came back would have been hashed and published as
+    // this record's evidence.
+    const rest = u.pathname === '/' ? '' : u.pathname
+    if (hasDotSegments(rest)) return null
+    return { cid: sub[1]! + rest, ns: sub[2]!.toLowerCase() as 'ipfs' | 'ipns' }
+  }
 
   // Path gateways: https://ipfs.io/ipfs/<cid>[/...]
   const path = /^\/(ipfs|ipns)\/([^/?#]+)(\/.*)?$/i.exec(u.pathname)
@@ -469,7 +562,10 @@ export function resolveTargets(uri: string): { targets: string[]; scheme: string
 
   if (lower.startsWith('ipfs://')) {
     const path = u.slice('ipfs://'.length).replace(/^ipfs\//i, '')
-    const cid = path.split('/')[0] ?? ''
+    // Split on the query and fragment too: they are not part of the identifier,
+    // and leaving them in made a perfectly valid `ipfs://<cid>?filename=x` read
+    // as "not a CID" — an accusation, produced by our own parsing.
+    const cid = path.split(/[/?#]/)[0] ?? ''
     // A scheme that promises content addressing, over something that is not a
     // content identifier, resolves nowhere for anybody.
     if (!isCid(cid)) return { targets: [], scheme: 'ipfs (not a CID)' }
@@ -486,6 +582,13 @@ export function resolveTargets(uri: string): { targets: string[]; scheme: string
   }
   if (lower.startsWith('ar://')) {
     const path = u.slice('ar://'.length)
+    const id = path.split(/[/?#]/)[0] ?? ''
+    // An Arweave transaction id is 43 base64url characters. Without this,
+    // `ar://` alone fetched each gateway's own home page and published it as
+    // the publisher's evidence — bytes hashed, archived and attributed to a
+    // record whose author never served them.
+    if (!/^[A-Za-z0-9_-]{43}$/.test(id)) return { targets: [], scheme: 'ar (not a transaction id)' }
+    if (hasDotSegments(path)) return { targets: [], scheme: 'ar (path traversal)' }
     return { targets: ARWEAVE_GATEWAYS.map((g) => `${g}${path}`), scheme: 'ar' }
   }
   if (lower.startsWith('data:')) return { targets: [u], scheme: 'data' }
@@ -518,7 +621,7 @@ export function resolveTargets(uri: string): { targets: string[]; scheme: string
  */
 export async function fetchEvidence(
   uri: string,
-  opts: { timeoutMs?: number; maxBytes?: number; attempts?: number } = {},
+  opts: { timeoutMs?: number; maxBytes?: number; attempts?: number; budgetMs?: number } = {},
 ): Promise<FetchOutcome> {
   const timeoutMs = opts.timeoutMs ?? EVIDENCE_TIMEOUT_MS
   const maxBytes = opts.maxBytes ?? EVIDENCE_MAX_BYTES
@@ -542,8 +645,20 @@ export async function fetchEvidence(
   const lastByTarget = new Map<string, FetchOutcome>()
   const stalledByTarget = new Set<string>()
 
-  for (let attempt = 0; attempt < attempts; attempt++) {
+  /**
+   * A ceiling on everything this record may cost.
+   *
+   * The per-attempt deadline bounds a request, not a record: attempts × targets,
+   * plus the backoff between passes, let one stalling host hold a worker for
+   * well over a minute — and the verdict was `inconclusive`, so the adversary
+   * bought the audit's time and paid in nothing.
+   */
+  const deadline = Date.now() + (opts.budgetMs ?? EVIDENCE_BUDGET_MS)
+  let exhausted = false
+
+  for (let attempt = 0; attempt < attempts && !exhausted; attempt++) {
     for (const target of targets) {
+      if (Date.now() >= deadline) { exhausted = true; break }
       const out = await fetchOnce(target, timeoutMs, maxBytes)
       if (out.kind === 'ok') return out
       /**
@@ -556,12 +671,28 @@ export async function fetchEvidence(
        * anybody else — the exact misclassification this module exists to prevent.
        */
       if (out.kind === 'unusable' && targets.length === 1) return out
+      /**
+       * With several targets an unusable one is a fact about that gateway, so
+       * it must not survive as this URI's answer either. Refusing to RETURN it
+       * was only half the guard: it was still stored as that target's last
+       * word, and the final fallback could hand it back — condemning the record
+       * on the strength of one bad gateway after all.
+       */
+      if (out.kind === 'unusable') {
+        lastByTarget.set(target, { kind: 'inconclusive', note: `gateway unusable: ${out.note}`, url: target })
+        stalledByTarget.add(target)
+        continue
+      }
       lastByTarget.set(target, out)
-      if (out.kind !== 'dead' && out.kind !== 'unusable') stalledByTarget.add(target)
+      // Only an answer of absence is not a stall; every unusable was handled
+      // above, so what remains here is `dead` or `inconclusive`.
+      if (out.kind !== 'dead') stalledByTarget.add(target)
       // A gateway that rate-limited us tells us nothing; try the next one now.
     }
-    // Every target failed. Only wait if something might still change.
-    if (attempt < attempts - 1) await sleep(EVIDENCE_RETRY_DELAY_MS * (attempt + 1))
+    // Every target failed. Only wait if something might still change, and only
+    // if the wait itself fits inside what this record is allowed to cost.
+    const backoff = EVIDENCE_RETRY_DELAY_MS * (attempt + 1)
+    if (attempt < attempts - 1 && Date.now() + backoff < deadline) await sleep(backoff)
   }
 
   /**

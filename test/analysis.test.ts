@@ -15,15 +15,34 @@ import type { FeedbackRecord } from '../src/sources/feedback.js'
 import type { Settlement } from '../src/sources/settlements.js'
 
 let passed = 0
-function check(name: string, fn: () => void) {
-  try {
-    fn()
+/**
+ * A test that returns a promise must be awaited by its caller.
+ *
+ * The synchronous version reported `✓` the instant an async body yielded, so
+ * an assertion that failed after the first `await` was counted as a pass and
+ * surfaced only as a late unhandled rejection — a green suite hiding a red
+ * test. Returning the promise makes forgetting the `await` fail loudly
+ * instead of silently.
+ */
+function check(name: string, fn: () => void | Promise<void>): void | Promise<void> {
+  const ok = () => {
     passed++
     console.log(`  ✓ ${name}`)
-  } catch (e) {
+  }
+  const bad = (e: unknown): never => {
     console.error(`  ✗ ${name}`)
     throw e
   }
+  let r: void | Promise<void>
+  try {
+    r = fn()
+  } catch (e) {
+    return bad(e)
+  }
+  if (r && typeof (r as Promise<void>).then === 'function') {
+    return (r as Promise<void>).then(ok, bad)
+  }
+  ok()
 }
 
 const addr = (n: number) => `0x${n.toString(16).padStart(40, '0')}` as Address
@@ -542,8 +561,18 @@ check('scheme comparison is case-insensitive', () => {
 })
 
 check('Arweave and data URIs resolve instead of being written off', () => {
-  assert.equal(resolveTargets('ar://abc').scheme, 'ar')
-  assert.ok(resolveTargets('ar://abc').targets.length >= 1)
+  // An Arweave transaction id is exactly 43 base64url characters. Anything
+  // else is a name someone invented, and spending a request per gateway to
+  // discover that is the same waste as ipfs://feedback-126-<timestamp>.
+  const TXID = 'AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_aBcDe'
+  assert.equal(TXID.length, 43)
+  assert.equal(resolveTargets(`ar://${TXID}`).scheme, 'ar')
+  assert.ok(resolveTargets(`ar://${TXID}`).targets.length >= 1)
+
+  const bogus = resolveTargets('ar://abc')
+  assert.equal(bogus.scheme, 'ar (not a transaction id)')
+  assert.equal(bogus.targets.length, 0, 'an invented name should cost no requests')
+
   assert.equal(resolveTargets('data:application/json,{}').scheme, 'data')
 })
 
@@ -652,6 +681,92 @@ check('a scheme with no transport is named, not silently dropped', () => {
   const { targets, scheme } = resolveTargets('magnet:?xt=urn:btih:abc')
   assert.equal(targets.length, 0)
   assert.equal(scheme, 'magnet')
+})
+
+check('multibase spellings a gateway serves are all recognised as identifiers', () => {
+  const { isCid } = FETCH
+  /**
+   * base32 is what most tools print, but it is not the only encoding a CID
+   * arrives in. An IPNS name is routinely written in base36 (`k…`) and some
+   * pipelines emit base16 (`f…`). Refusing those spellings did not make the
+   * audit cautious: it classified a perfectly resolvable pointer as an
+   * invented filename and recorded a finding against the record.
+   */
+  assert.equal(isCid('k51qzi5uqu5dlvj2baxnqndepeb86cbk3ng7n3i46uzyxzyqj2xjonzllnv0v8'), true, 'base36 IPNS')
+  assert.equal(isCid('f01701220c3c4733ec8affd06cf9e9ff50ffc6bcd2ec85a6170004bb709669c31de94391a'), true, 'base16')
+  assert.equal(isCid('zdj7WWeQ43G6JJvLWQWZpyHuAMq6uYWRjkBXFad11vE2LHhQ7'), true, 'base58btc')
+  // Still not identifiers, in any base.
+  assert.equal(isCid('feedback-126-1771338626265'), false)
+  assert.equal(isCid('k'), false)
+})
+
+check('a gateway URL keeps its path, and query or fragment do not eat the CID', () => {
+  const { cidFromGatewayUrl } = FETCH
+  const CID = 'bafkreiedc46lhb6dv46cowbwz4nl6726a6zpcon6y6ejo64u6gyxjciyre'
+  /**
+   * A gateway URL is a locator for a *file*, and the path after the CID is
+   * part of which file. Truncating it re-pointed `.../<cid>/meta/2.json` at
+   * the directory root, so the bytes fetched, hashed and archived were a
+   * different document than the one the record declared.
+   */
+  assert.deepEqual(cidFromGatewayUrl(`https://ipfs.io/ipfs/${CID}/meta/2.json`), {
+    cid: `${CID}/meta/2.json`, ns: 'ipfs',
+  })
+  // Query strings and fragments belong to the URL, never to the identifier.
+  assert.deepEqual(cidFromGatewayUrl(`https://ipfs.io/ipfs/${CID}?filename=a.json`), { cid: CID, ns: 'ipfs' })
+  assert.deepEqual(cidFromGatewayUrl(`https://ipfs.io/ipfs/${CID}#top`), { cid: CID, ns: 'ipfs' })
+  // Subdomain form carries the CID in the host and the file in the path.
+  assert.deepEqual(cidFromGatewayUrl(`https://${CID}.ipfs.dweb.link/dir/file.json`), {
+    cid: `${CID}/dir/file.json`, ns: 'ipfs',
+  })
+  // A dot segment anywhere in that path is a traversal, not a filename.
+  assert.equal(cidFromGatewayUrl(`https://ipfs.io/ipfs/${CID}/../secrets`), null)
+  assert.equal(cidFromGatewayUrl('https://example.test/a.json'), null)
+})
+
+await check('a record cannot spend more time than its budget allows', async () => {
+  /**
+   * The per-attempt deadline bounds a REQUEST, not a record: attempts times
+   * targets, plus the backoff between passes, let one stalling host hold a
+   * worker for over a minute and pay nothing for it — the verdict was
+   * `inconclusive`, so the cost was ours and the finding was theirs.
+   *
+   * With the budget already spent, no request may be issued at all.
+   */
+  const started = Date.now()
+  const out = await FETCH.fetchEvidence('https://example.test/evidence.json', { budgetMs: 0 })
+  assert.equal(out.kind, 'inconclusive')
+  assert.match(out.note ?? '', /no attempt completed/)
+  assert.ok(Date.now() - started < 1000, 'an exhausted budget must not reach the network')
+})
+
+await check('a data: URI carrying bytes is read, and a corrupt one is refused', async () => {
+  // Percent-decoding through `decodeURIComponent` is a TEXT decoder: it throws
+  // on any sequence that is not valid UTF-8, so a data: URI carrying binary
+  // was reported as an unusable URI — an accusation about a document sitting
+  // in the string.
+  const binary = await FETCH.fetchEvidence('data:application/octet-stream,%89PNG%0D%0A')
+  assert.equal(binary.kind, 'ok')
+  assert.deepEqual(Array.from(binary.bytes ?? []), [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a])
+
+  const json = await FETCH.fetchEvidence('data:application/json;base64,eyJhIjoxfQ==')
+  assert.equal(json.kind, 'ok')
+  assert.equal(json.text, '{"a":1}')
+
+  /**
+   * `Buffer.from(x, 'base64')` never throws: it drops anything outside the
+   * alphabet and returns short bytes. A corrupt payload was therefore
+   * published as evidence successfully retrieved, archived under the digest
+   * of something nobody ever wrote.
+   */
+  const corrupt = await FETCH.fetchEvidence('data:application/json;base64,eyJhIjox*****')
+  assert.equal(corrupt.kind, 'unusable')
+  assert.match(corrupt.note ?? '', /base64/)
+
+  // The size cap applies to a payload that never touched the network too.
+  const big = await FETCH.fetchEvidence('data:text/plain,' + 'a'.repeat(200), { maxBytes: 100 })
+  assert.equal(big.kind, 'inconclusive')
+  assert.match(big.note ?? '', /oversize/)
 })
 
 console.log('\npayment attribution')

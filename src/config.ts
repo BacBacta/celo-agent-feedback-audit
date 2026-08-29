@@ -139,6 +139,17 @@ export const EVIDENCE_TIMEOUT_MS = envNumber('EVIDENCE_TIMEOUT_MS', 8_000)
  */
 export const EVIDENCE_ATTEMPTS = envNumber('EVIDENCE_ATTEMPTS', 2)
 
+/**
+ * Wall-clock ceiling for everything one record may cost.
+ *
+ * The per-attempt deadline bounds a request; it does not bound a record. Two
+ * passes over five targets is ten attempts plus the backoff between them, so a
+ * host that stalls every time held one worker for more than eighty seconds —
+ * and the result was `inconclusive`, which is to say the adversary bought the
+ * audit's time and paid in nothing. This bounds the whole race.
+ */
+export const EVIDENCE_BUDGET_MS = envNumber('EVIDENCE_BUDGET_MS', 45_000)
+
 /** Base backoff between passes; multiplied by the pass number. */
 export const EVIDENCE_RETRY_DELAY_MS = envNumber('EVIDENCE_RETRY_DELAY_MS', 2_000, 0)
 
