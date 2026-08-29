@@ -8,6 +8,7 @@ import { loadIdentity, loadSelfVerified } from './sources/identity.js'
 import { loadSettlementsFrom } from './sources/settlements.js'
 import { checkEvidence, type EvidenceVerdict } from './analysis/evidence.js'
 import { EvidenceArchive } from './archive.js'
+import { VerdictCache } from './verdict-cache.js'
 // One escaper, shared with the offline tooling and with the attestation
 // service that consumes these rows. Two implementations of one format drift,
 // and this format's consumer writes to a public ledger.
@@ -132,10 +133,26 @@ async function main() {
    * record the moment one check is dropped.
    */
   const verdictByRecord = new Map<(typeof toCheck)[number], EvidenceVerdict>()
+
+  /**
+   * Retrieval resumes. It is the phase that takes hours, and until now a run
+   * interrupted near the end repeated every fetch.
+   */
+  const cache = new VerdictCache(`${process.env.CACHE_DIR ?? 'data'}/evidence-verdicts-${fromBlock}.jsonl`)
+  const pending: typeof toCheck = []
+  for (const rec of toCheck) {
+    const hit = cache.get(VerdictCache.key(rec))
+    if (hit) verdictByRecord.set(rec, hit)
+    else pending.push(rec)
+  }
+  if (cache.size) {
+    console.log(`  resuming: ${verdictByRecord.size} verdict(s) already decided, ${pending.length} to fetch`)
+  }
+
   const CONCURRENCY = 8
   let failedChecks = 0
-  for (let i = 0; i < toCheck.length; i += CONCURRENCY) {
-    const batch = toCheck.slice(i, i + CONCURRENCY)
+  for (let i = 0; i < pending.length; i += CONCURRENCY) {
+    const batch = pending.slice(i, i + CONCURRENCY)
     const settled = await Promise.all(
       batch.map(async (f) => {
         try {
@@ -158,8 +175,12 @@ async function main() {
         }
       }),
     )
-    for (const { rec, v } of settled) if (v) verdictByRecord.set(rec, v)
-    process.stdout.write(`\r  evidence: ${Math.min(i + CONCURRENCY, toCheck.length)}/${toCheck.length}`)
+    for (const { rec, v } of settled) {
+      if (!v) continue
+      verdictByRecord.set(rec, v)
+      cache.put(VerdictCache.key(rec), v)
+    }
+    process.stdout.write(`\r  evidence: ${verdictByRecord.size}/${toCheck.length}`)
   }
   if (toCheck.length) process.stdout.write('\n')
   if (failedChecks) console.log(`  ${failedChecks} check(s) threw and were dropped — see errors above`)
