@@ -151,6 +151,17 @@ capped at 1 MB (`EVIDENCE_MAX_BYTES`) and any URI resolving into private address
 space is refused unfetched — `feedbackURI` is written by the party being
 audited, and is treated as hostile input throughout.
 
+## The coverage manifest
+
+A completed run writes `out/sweep.json`: the block range examined, how many
+feedback records the **indexer** saw in it, and how many rows were exported. The
+attestation service publishes those numbers on chain so that omission becomes
+falsifiable — re-index the same range, count, and compare.
+
+`observed` deliberately comes from the indexer rather than from the export. A
+coverage claim counted from the rows it is about to attest would agree with
+itself by construction and prove nothing.
+
 ## The evidence corpus
 
 Every file the audit actually reads is stored under `out/evidence-corpus/`,

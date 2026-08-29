@@ -391,6 +391,27 @@ async function main() {
     ].join('\n'),
   )
 
+  /**
+   * What this run examined, for the attester to publish on chain.
+   *
+   * `observed` comes from the indexer, not from the export: the point of a
+   * coverage claim is that it counts what the registry emitted, including the
+   * records this audit deliberately writes no verdict for. Taking it from the
+   * CSV would make the claim agree with itself by construction.
+   */
+  writeFileSync(
+    'out/sweep.json',
+    JSON.stringify({
+      fromBlock: fromBlock.toString(),
+      toBlock: toBlock.toString(),
+      observed: feedback.length,
+      declaringEvidence: withPointer.length,
+      exportedRows: evidenceRows.length,
+      auditVersion: AUDIT_VERSION,
+      producedAt: new Date().toISOString(),
+    }, null, 2),
+  )
+
   writeFileSync('out/audit.md', renderMarkdown(result))
   writeFileSync('out/audit.json', renderJSON(result))
 
