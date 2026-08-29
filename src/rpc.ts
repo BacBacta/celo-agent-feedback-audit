@@ -3,7 +3,26 @@ import { createPublicClient, http, type AbiEvent, type Address } from 'viem'
 import { celo } from 'viem/chains'
 import { LOG_CHUNK_SIZE } from './config.js'
 
-const RPC_URL = process.env.CELO_RPC_URL ?? 'https://forno.celo.org'
+/**
+ * A database-backed indexer by default, not the public gateway.
+ *
+ * forno.celo.org is a load-balanced cluster whose nodes hold divergent log
+ * indexes: asked the same immutable range three times it answered 46, 40 and
+ * 37 events where this endpoint answered 77. A default that silently drops half
+ * the history is not a defensible default, however convenient — and the
+ * determinism check below now refuses to run on it anyway, so keeping it would
+ * only mean every first run fails with an instruction to change it.
+ *
+ * forno remains one CELO_RPC_URL away for anyone who wants to reproduce that.
+ */
+const RPC_URL = process.env.CELO_RPC_URL ?? 'https://celo.blockscout.com/api/eth-rpc'
+
+/**
+ * Indexer endpoints speak single-request JSON-RPC only, so batching must be off
+ * for them. Inferring it from the URL removes a second environment variable
+ * that, forgotten, produces a wall of unexplained failures.
+ */
+const BATCH_DEFAULT = !/\/api\/eth-rpc\/?$/.test(RPC_URL)
 const CONCURRENCY = Math.max(1, Number(process.env.RPC_CONCURRENCY ?? 5))
 const CACHE_DIR = process.env.CACHE_DIR ?? 'data'
 
@@ -17,7 +36,7 @@ const CACHE_DIR = process.env.CACHE_DIR ?? 'data'
 export const client = createPublicClient({
   chain: celo,
   transport: http(RPC_URL, {
-    batch: process.env.RPC_BATCH !== '0',
+    batch: process.env.RPC_BATCH === undefined ? BATCH_DEFAULT : process.env.RPC_BATCH !== '0',
     retryCount: 5,
     retryDelay: 400,
   }),
@@ -57,6 +76,85 @@ export async function throughRateLimit<T>(what: string, fn: () => Promise<T>): P
       await sleep(ms)
     }
   }
+}
+
+/**
+ * Refuse to audit through an endpoint that answers differently each time.
+ *
+ * `eth_getLogs` over a range of blocks that were mined months ago has exactly
+ * one correct answer, and a load-balanced cluster of nodes with divergent log
+ * indexes does not have to give it. Measured against forno on 2026-08-29, over
+ * one immutable 60,000-block range: three consecutive passes returned 46, 40
+ * and 37 events, where a database-backed indexer returned 77. Between 40% and
+ * 52% of the history silently absent, differently every time, with no error
+ * raised anywhere.
+ *
+ * An audit that reports a clean number from that is worse than one that fails:
+ * the number looks finished. So the endpoint is asked the same immutable
+ * question twice before anything is indexed, and a disagreement stops the run.
+ *
+ * This cannot prove an endpoint complete — an indexer that is consistently
+ * wrong passes — which is why the cross-check against a second provider still
+ * exists. It only catches the endpoint that cannot agree with itself, and that
+ * turned out to be the default.
+ */
+export async function assertDeterministicLogs(params: {
+  address: Address
+  event: AbiEvent
+  fromBlock: bigint
+  toBlock: bigint
+}): Promise<void> {
+  if (process.env.SKIP_DETERMINISM_CHECK === '1') {
+    console.log('  determinism check: SKIPPED (SKIP_DETERMINISM_CHECK=1)')
+    return
+  }
+
+  // Stay well behind the head: recent blocks may legitimately still be settling.
+  const ceiling = params.toBlock - 50_000n
+  if (ceiling <= params.fromBlock) return
+
+  const span = LOG_CHUNK_SIZE
+  const ask = (from: bigint) =>
+    throughRateLimit('determinism', () =>
+      client.getLogs({
+        address: params.address,
+        event: params.event,
+        fromBlock: from,
+        toBlock: from + span - 1n,
+      }),
+    )
+
+  // Find a probe window that actually contains events; an empty one agrees
+  // with itself for free and proves nothing.
+  let probe: bigint | null = null
+  let first: unknown[] = []
+  for (let at = params.fromBlock; at < ceiling && probe === null; at += span * 40n) {
+    const logs = await ask(at)
+    if (logs.length > 0) { probe = at; first = logs }
+  }
+  if (probe === null) {
+    console.log('  determinism check: no events found to probe with — skipped')
+    return
+  }
+
+  const second = await ask(probe)
+  if (second.length === first.length) {
+    console.log(`  determinism check: ${first.length} events, twice, over blocks ${probe}–${probe + span - 1n} ✓`)
+    return
+  }
+
+  const third = await ask(probe)
+  throw new Error(
+    `The RPC endpoint is not deterministic over immutable history.\n` +
+      `  endpoint  ${RPC_URL}\n` +
+      `  blocks    ${probe}–${probe + span - 1n} (mined long ago; the answer cannot change)\n` +
+      `  answers   ${first.length}, ${second.length}, ${third.length} events\n` +
+      `A load-balanced cluster whose nodes hold divergent log indexes will\n` +
+      `undercount silently, and the audit would publish that shortfall as a\n` +
+      `finding about the registry. Use a database-backed indexer:\n` +
+      `  CELO_RPC_URL=https://celo.blockscout.com/api/eth-rpc RPC_BATCH=0 npm run audit\n` +
+      `Set SKIP_DETERMINISM_CHECK=1 only to reproduce a known-bad run deliberately.`,
+  )
 }
 
 export async function latestBlock(): Promise<bigint> {

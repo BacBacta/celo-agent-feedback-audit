@@ -1,8 +1,8 @@
 import { mkdirSync, writeFileSync } from 'node:fs'
 import type { Address } from 'viem'
-import { latestBlock } from './rpc.js'
+import { latestBlock, assertDeterministicLogs } from './rpc.js'
 import { AUDIT_VERSION } from './config.js'
-import { BLOCKS_PER_DAY, REGISTRY_DEPLOY_BLOCK } from './config.js'
+import { BLOCKS_PER_DAY, REGISTRY_DEPLOY_BLOCK, REPUTATION_REGISTRY, NEW_FEEDBACK_EVENT } from './config.js'
 import { loadFeedback } from './sources/feedback.js'
 import { loadIdentity, loadSelfVerified } from './sources/identity.js'
 import { loadSettlementsFrom } from './sources/settlements.js'
@@ -31,14 +31,37 @@ async function main() {
   console.log(`  blocks ${fromBlock} → ${toBlock}\n`)
 
   console.log('Indexing…')
+  /**
+   * Before anything is counted, establish that the endpoint can answer the same
+   * immutable question the same way twice. It is the cheapest possible check
+   * and it catches the failure that produces the most confident wrong number.
+   */
+  await assertDeterministicLogs({
+    address: REPUTATION_REGISTRY,
+    event: NEW_FEEDBACK_EVENT,
+    fromBlock: REGISTRY_DEPLOY_BLOCK,
+    toBlock,
+  })
   const feedback = await loadFeedback(fromBlock, toBlock)
   if (feedback.length === 0) {
     console.log('\nNo feedback records in this window. Widen AUDIT_WINDOW and re-run.')
     return
   }
 
-  const identity = await loadIdentity(fromBlock, toBlock)
-  const selfVerified = await loadSelfVerified(fromBlock, toBlock)
+  /**
+   * Ownership is cumulative state, not events in a window.
+   *
+   * Scanning the Identity Registry over the same range as the feedback means
+   * every agent registered before that range has no known owner — and
+   * attribution needs the owner, so a windowed run reports "agent owner
+   * unknown" and refuses to attribute payments that are perfectly ordinary.
+   * Measured on a 45-day window: both verified payments came back unattributed
+   * for exactly this reason. The registry's history is replayed in full
+   * regardless of the window, and cached, so the answer does not depend on how
+   * much feedback the run happened to look at.
+   */
+  const identity = await loadIdentity(REGISTRY_DEPLOY_BLOCK, toBlock)
+  const selfVerified = await loadSelfVerified(REGISTRY_DEPLOY_BLOCK, toBlock)
 
   const reviewers = [...new Set(feedback.map((f) => f.reviewer.toLowerCase()))] as Address[]
   console.log(`  ${reviewers.length} distinct reviewers`)

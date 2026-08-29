@@ -160,26 +160,42 @@ an assertion whose proof is a dead link. Set `ARCHIVE_EVIDENCE=0` to skip it.
 
 ## Choosing an RPC source — read this before a full-history run
 
-The counter-analysis of this tool's own first full run found that
-`forno.celo.org` — a load-balanced cluster — returns **inconsistent
-`eth_getLogs` results for identical, immutable block ranges**: two scans of the
-same dense bucket disagreed in both directions. Any single pass through it
-under-counts unpredictably, with no error raised.
+**The audit refuses to run on an endpoint that cannot answer the same immutable
+question twice.** Before indexing anything it asks for the logs of one long-mined
+block range, twice, and stops if the answers differ.
 
-For anything you intend to publish, scan against an indexer-backed source
-instead, which answers from a database and is deterministic:
+That check exists because the default used to fail it. Measured on 2026-08-29
+over blocks 72,200,000–72,260,000 — mined months earlier, so there is exactly
+one correct answer:
+
+| source | events returned |
+|---|---|
+| `forno.celo.org`, first pass | 46 |
+| `forno.celo.org`, second pass | 40 |
+| `forno.celo.org`, third pass | 37 |
+| `celo.blockscout.com/api/eth-rpc` | **77** |
+
+Between 40% and 52% of the history silently absent, differently every time, with
+no error raised anywhere. forno is a load-balanced cluster whose nodes hold
+divergent log indexes; a full-history run through it reports a clean number that
+is missing half its input, and the shortfall gets published as a finding about
+the registry rather than about the endpoint.
+
+So the default is now a database-backed indexer, and batching is switched off
+automatically for `/api/eth-rpc` endpoints, which speak single-request JSON-RPC:
 
 ```bash
-CELO_RPC_URL=https://celo.blockscout.com/api/eth-rpc \
-RPC_BATCH=0 \
-CACHE_DIR=data-bs \
-MAX_FILE_FETCHES=20000 \
-AUDIT_WINDOW=all npm run audit
+npm run audit                                    # uses the indexer by default
+CELO_RPC_URL=https://your-node npm run audit     # anything else must pass the check
 ```
 
-`RPC_BATCH=0` because that endpoint speaks single-request JSON-RPC only, and a
-fresh `CACHE_DIR` so the forno-tainted cache is kept aside for comparison
-rather than merged. `crosscheck.mjs` then measures the gap between the two.
+The check cannot prove an endpoint complete — an indexer that is consistently
+wrong passes it — which is why `npm run crosscheck` against a second provider
+still matters. It only catches the endpoint that disagrees with itself, and that
+turned out to be the one everybody reaches for first.
+
+`SKIP_DETERMINISM_CHECK=1` exists solely to reproduce a known-bad run on purpose.
+
 
 ## Method
 
