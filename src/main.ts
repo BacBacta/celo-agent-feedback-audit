@@ -303,7 +303,7 @@ async function main() {
     'note', 'partyNote', 'feedbackURI',
   ]
 
-  const UNCHECKED_NOTE = 'not checked — beyond MAX_FILE_FETCHES sampling cap'
+  const UNCHECKED_NOTE = 'not checked — beyond MAX_FILE_FETCHES sampling cap; nothing is attested for this record'
 
   writeFileSync(
     'out/evidence.csv',
@@ -316,14 +316,26 @@ async function main() {
           rec.agentId,
           rec.reviewer,
           rec.feedbackIndex,
-          v ? rung(rec, v) : unchecked ? 'EvidenceInconclusive' : 'EvidenceAbsent',
-          v ? evidenceRung(rec, v) : unchecked ? 'Inconclusive' : 'Absent',
+          /**
+           * `NotChecked` is not a verdict, and must not be spelled like one.
+           *
+           * These rows were sampled out: we never opened the file. Calling
+           * that `EvidenceInconclusive` — "we tried and learned nothing" —
+           * published a retrieval failure against publishers nobody had
+           * contacted, and the backfill wrote every one of them on chain. The
+           * row stays here, because a sampled audit must say which records it
+           * skipped; the backfill reads this rung and writes nothing.
+           */
+          v ? rung(rec, v) : unchecked ? 'NotChecked' : 'EvidenceAbsent',
+          v ? evidenceRung(rec, v) : unchecked ? 'NotChecked' : 'Absent',
           rec.hasURI,
           rec.hasHash,
           v?.fetched ?? false,
           v?.jsonValid ?? false,
           v?.hashMatches ?? false,
-          v?.inconclusive ?? unchecked,
+          // An unopened record produced no retrieval outcome at all, so this
+          // column is false for it: `inconclusive` describes an attempt.
+          v?.inconclusive ?? false,
           v?.claimsPayment ?? false,
           v?.proofPresent ?? false,
           v?.txExists ?? false,
