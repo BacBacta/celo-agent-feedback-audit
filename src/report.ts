@@ -66,6 +66,10 @@ export interface AuditResult {
     corpusSize: number
     sampled: number
     sampleStride: number
+    /** Which hosts the inconclusive count is about, largest first. */
+    inconclusiveTopHosts: { host: string; records: number; share: number }[]
+    /** Distinct hosts behind the inconclusive records. */
+    inconclusiveHosts: number
   }
   reconciliation: ReconciliationStats
   concentration: ConcentrationStats
@@ -204,6 +208,19 @@ indistinguishable rows is how a table implies a narrowing that never happened.
 > runs and reused, and a run resumed entirely from cache writes none. Under
 > \`out/evidence-corpus/\`, so every verdict above stays checkable after the
 > originals go offline.
+${
+  r.evidence.inconclusiveTopHosts.length
+    ? `
+**And that number is about a handful of hosts, not about the web.** The ${num(r.evidence.inconclusive)} unreachable records come from ${num(r.evidence.inconclusiveHosts)} distinct hosts, distributed like this:
+
+| Host | Records | Share of inconclusive |
+|---|---|---|
+${r.evidence.inconclusiveTopHosts.map((h) => `| \`${h.host}\` | ${num(h.records)} | ${(h.share * 100).toFixed(1)}% |`).join('\n')}
+
+The largest carries **${(r.evidence.inconclusiveTopHosts[0]!.share * 100).toFixed(0)}%**. This audit still classes those records inconclusive rather than dead, and that is deliberate: a host that never answers has not told us its files are gone. But a reader owed the number is also owed the fact that it is concentrated in one publisher's infrastructure rather than spread across the registry.
+`
+    : ''
+}
 
 ## Payment backing, reconstructed${r.settlementsRan === false ? ' — not run' : ''}
 
@@ -385,6 +402,8 @@ export function collectEvidence(verdicts: EvidenceVerdict[], sampled: number) {
     contentAddressed: verdicts.filter((v) => v.contentId !== null).length,
     archivedThisRun: 0,
     corpusSize: 0,
+    inconclusiveTopHosts: [] as { host: string; records: number; share: number }[],
+    inconclusiveHosts: 0,
     sampled,
   }
 }

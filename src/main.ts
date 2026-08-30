@@ -278,6 +278,36 @@ async function main() {
   // content id — a warm resume cache fills the second without fetching.
   evidence.archivedThisRun = archive ? archive.written : 0
   evidence.corpusSize = archive ? archive.size : 0
+  /**
+   * Which hosts the inconclusive count is actually about.
+   *
+   * "Records this audit could not reach, for reasons that prove nothing" is
+   * honest and, published as one number, still misleads: it reads as a diffuse
+   * network tax spread across the registry. It is not. One host accounts for
+   * nearly half of it and never answered once. That is a fact about a single
+   * publisher's infrastructure, and a reader who is not told cannot tell the
+   * difference between "the web is flaky" and "one operator's files are all
+   * gone but we decline to say so".
+   */
+  {
+    const perHost = new Map<string, number>()
+    for (const [rec, v] of verdictByRecord) {
+      if (!v.inconclusive) continue
+      let host: string
+      try {
+        host = new URL(rec.feedbackURI).hostname || '(no host)'
+      } catch {
+        host = '(unparseable URI)'
+      }
+      perHost.set(host, (perHost.get(host) ?? 0) + 1)
+    }
+    const total = [...perHost.values()].reduce((a, b) => a + b, 0) || 1
+    evidence.inconclusiveTopHosts = [...perHost.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([host, records]) => ({ host, records, share: records / total }))
+    evidence.inconclusiveHosts = perHost.size
+  }
   evidence.declaresURI = withPointer.length
   evidence.declaresHash = feedback.filter((f) => f.hasHash).length
   evidence.hashWithoutURI = feedback.filter((f) => f.hasHash && !f.hasURI).length

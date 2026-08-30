@@ -228,7 +228,39 @@ const replacer = (_k: string, v: unknown) =>
 const reviver = (_k: string, v: any) =>
   v && typeof v === 'object' && typeof v.__bigint === 'string' ? BigInt(v.__bigint) : v
 
-interface CacheState { completedUpTo: string }
+/**
+ * `query` fingerprints the filter the cached logs answer, not just the range.
+ *
+ * The key carried the token, a batch *index*, the start block and the
+ * endpoint — and not the addresses in the batch. `settle-USDC-0-58396729` is
+ * whatever two thousand reviewers happened to land in batch 0 on the run that
+ * wrote it. Add reviewers to the registry, re-run, and batch 0 holds a
+ * different set while reading the same file: the sweep then republishes the
+ * previous run's transfers as this run's answer, silently, and every
+ * payment-backed figure downstream is computed over the wrong population.
+ *
+ * Absent on caches written before this field existed. Those are readable, and
+ * a run that finds one says so rather than trusting it in silence.
+ */
+interface CacheState {
+  completedUpTo: string
+  query?: string
+  /**
+   * How many logs the completed portion of this sweep found.
+   *
+   * Present so that a sweep which found *nothing* can prove it did the work.
+   * Resuming required both the state file and the logs file to exist, and a
+   * batch that matched no transfers never created a logs file — so its state
+   * file, saying the whole range was swept, was ignored and the range was
+   * re-swept from scratch on every subsequent run. Two full-history passes in
+   * this registry are in that position, each about forty minutes, each
+   * correctly returning zero, repeated for as long as the caches live. The
+   * state file is the authority on how far; this field lets a missing logs
+   * file mean "found nothing" rather than "never ran", while still catching a
+   * logs file that was truncated or half-deleted underneath us.
+   */
+  found?: number
+}
 
 /**
  * The endpoint is part of the cache key.
@@ -279,23 +311,64 @@ export async function getLogsChunked<T extends AbiEvent>(params: {
   let out: any[] = []
   let cursor = fromBlock
 
+  /**
+   * A stable digest of the filter arguments — the addresses, in the order the
+   * caller batched them. Sorting would hide a reordering that changes which
+   * addresses land in which batch, which is exactly what must not be hidden.
+   */
+  const queryTag = createHash('sha256')
+    .update(JSON.stringify(args ?? null, (_k, v) => (typeof v === 'bigint' ? v.toString() : v)))
+    .digest('hex')
+    .slice(0, 16)
+
   let paths: ReturnType<typeof cachePaths> | null = null
   if (cacheKey) {
     mkdirSync(CACHE_DIR, { recursive: true })
     paths = cachePaths(cacheKey)
-    if (existsSync(paths.state) && existsSync(paths.logs)) {
+    if (existsSync(paths.state)) {
       try {
         const state: CacheState = JSON.parse(readFileSync(paths.state, 'utf8'))
         const resumeAt = BigInt(state.completedUpTo) + 1n
+        if (state.query !== undefined && state.query !== queryTag) {
+          throw new Error(
+            `Cache ${cacheKey} was written for a different filter (${state.query}, now ${queryTag}).\n` +
+              `Its logs answer a question this run is not asking. Delete data/${cacheKey}-*.jsonl\n` +
+              'and its .state file to re-sweep, or pin the run to the block range that produced it.',
+          )
+        }
+        if (state.query === undefined && args) {
+          console.warn(
+            `\n  ! ${cacheKey} predates filter fingerprinting. Its logs were fetched for` +
+              '\n    some argument set this run cannot verify is the one it is asking for.' +
+              '\n    Re-sweep from scratch if the reviewer set may have changed.',
+          )
+        }
         if (resumeAt > fromBlock && resumeAt <= toBlock + 1n) {
-          out = readFileSync(paths.logs, 'utf8')
-            .split('\n')
-            .filter(Boolean)
-            .map((line) => JSON.parse(line, reviver))
+          out = existsSync(paths.logs)
+            ? readFileSync(paths.logs, 'utf8')
+                .split('\n')
+                .filter(Boolean)
+                .map((line) => JSON.parse(line, reviver))
+            : []
+          if (state.found !== undefined && state.found !== out.length) {
+            throw new Error(
+              `Cache ${cacheKey} says it found ${state.found} logs and its file holds ${out.length}.\n` +
+                'Resuming would publish a truncated sweep as a complete one. Delete\n' +
+                `data/${cacheKey}-*.jsonl and its .state file to re-sweep.`,
+            )
+          }
           cursor = resumeAt
           process.stdout.write(`  resuming ${cacheKey} at block ${cursor} (${out.length} cached)\n`)
         }
-      } catch {
+      } catch (err) {
+        /**
+         * An unreadable cache is ignored and refetched. A cache that is
+         * readable and answers a *different filter* is not: continuing there
+         * means publishing another run's logs as this one's, which is the
+         * failure this fingerprint exists to prevent.
+         */
+        const m = (err as Error).message ?? ''
+        if (m.includes('was written for a different filter') || m.includes('and its file holds')) throw err
         /* unreadable cache is simply ignored and refetched */
       }
     }
@@ -378,7 +451,7 @@ export async function getLogsChunked<T extends AbiEvent>(params: {
             fresh.map((l) => JSON.stringify(l, replacer)).join('\n') + '\n',
           )
         }
-        writeFileSync(paths.state, JSON.stringify({ completedUpTo: waveEnd.toString() }))
+        writeFileSync(paths.state, JSON.stringify({ completedUpTo: waveEnd.toString(), query: queryTag, found: out.length }))
       }
 
       cursor = waveEnd + 1n

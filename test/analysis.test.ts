@@ -1277,8 +1277,21 @@ await check('changing what a verdict means starts a new cache, it does not inher
   const h = createHash('sha256')
   for (const f of DECIDERS) h.update(FS.readFileSync(f))
   const digest = h.digest('hex').slice(0, 16)
+  /**
+   * a4019c3f… — rpc.ts gained a filter fingerprint and a found-count on the
+   * log cache.
+   *
+   * The judgment this guard asks for: cached evidence verdicts stay valid. The
+   * change is inside `getLogsChunked`, which indexes events; an evidence
+   * verdict is decided by fetch-evidence.ts, evidence.ts and payment.ts, and
+   * payment verification reads a transaction receipt rather than a log range.
+   * Nothing about what a verdict *is* moved, so RETRIEVAL_RULES stays at r8
+   * and the ten thousand cached verdicts keep answering the question they were
+   * asked. The digest moves because the guard watches whole files, which is
+   * the right side to err on.
+   */
   assert.equal(
-    digest, '2ba92bf63c21f5b2',
+    digest, 'a4019c3fe5f82268',
     `retrieval semantics changed (digest ${digest}). Bump RETRIEVAL_RULES ` +
       `(currently "${RETRIEVAL_RULES}") and update this digest, or cached verdicts ` +
       'decided under the old rules will be republished as a fresh measurement.',
@@ -1468,6 +1481,104 @@ await check('an empty work list and a width wider than the list are both fine', 
   assert.equal(calls, 0)
   await pool([1, 2], 64, async () => { calls++ })
   assert.equal(calls, 2, 'width is clamped to the number of items, and every item still runs')
+})
+
+console.log('\na cached log range remembers which filter it answered')
+
+/**
+ * The settlement sweep batches reviewers 2,000 at a time and cached each batch
+ * under `settle-<token>-<batchIndex>-<fromBlock>`. The batch *index* is in the
+ * key; the addresses in it are not. Add reviewers to the registry, re-run, and
+ * batch 0 holds a different set while reading the same file — so the sweep
+ * republishes the previous run's transfers as this run's answer, and every
+ * payment-backed figure downstream is computed over the wrong population.
+ */
+check('the log cache records the filter it was fetched for, not just the range', () => {
+  const src: string = FS.readFileSync('src/rpc.ts', 'utf8')
+
+  assert.match(
+    src, /interface CacheState \{[^}]*query\?: string/,
+    'the cache state must carry a fingerprint of the filter arguments',
+  )
+  assert.match(
+    src, /state\.query !== undefined && state\.query !== queryTag/,
+    'a resume must compare the stored fingerprint against this run’s filter',
+  )
+  assert.match(
+    src, /was written for a different filter/,
+    'a mismatch must refuse, not warn-and-continue: continuing publishes another run’s logs',
+  )
+  const stateWrites = [...src.matchAll(/writeFileSync\(paths\.state,[^\n]*/g)].map((m) => m[0])
+  assert.ok(stateWrites.length > 0, 'no state write found in rpc.ts — the guard is not reading the file')
+  for (const w of stateWrites) {
+    assert.match(
+      w, /query: queryTag/,
+      `a state write omits the fingerprint, so the next run has nothing to compare: ${w}`,
+    )
+  }
+  /**
+   * And the catch that swallows an unreadable cache must not swallow this.
+   * The refusal is raised inside the same try block it guards.
+   */
+  assert.match(
+    src, /m\.includes\('was written for a different filter'\)[\s\S]{0,80}throw err/,
+    'the unreadable-cache catch must re-throw a filter mismatch',
+  )
+})
+
+await check('the filter fingerprint distinguishes address sets and does not sort them', async () => {
+  const { createHash } = await import('node:crypto')
+  const tag = (args: unknown) =>
+    createHash('sha256')
+      .update(JSON.stringify(args ?? null, (_k, v) => (typeof v === 'bigint' ? v.toString() : v)))
+      .digest('hex')
+      .slice(0, 16)
+
+  const a = tag({ from: ['0xaa', '0xbb'] })
+  const b = tag({ from: ['0xaa', '0xcc'] })
+  const reordered = tag({ from: ['0xbb', '0xaa'] })
+  assert.notEqual(a, b, 'a different address set must be a different fingerprint')
+  assert.notEqual(
+    a, reordered,
+    'reordering changes which addresses land in which batch, so it must not be hidden by sorting',
+  )
+  assert.notEqual(tag(undefined), a, 'an unfiltered sweep is not the same query as a filtered one')
+})
+
+/**
+ * A sweep that found nothing must be able to prove it ran.
+ *
+ * Resuming required the state file AND the logs file to exist. A batch that
+ * matched no transfers never created a logs file, so its state file — saying
+ * the entire range had been swept — was ignored and the range re-swept from
+ * scratch, every run, forever. Two full-history passes over this registry are
+ * in exactly that position: about forty minutes each, correctly returning
+ * zero, repeated indefinitely because the evidence of the work was an absent
+ * file.
+ */
+check('a completed sweep that found nothing is not re-swept from scratch', () => {
+  const src: string = FS.readFileSync('src/rpc.ts', 'utf8')
+
+  assert.doesNotMatch(
+    src, /existsSync\(paths\.state\) && existsSync\(paths\.logs\)/,
+    'the resume must not require a logs file: an empty result never writes one',
+  )
+  assert.match(
+    src, /existsSync\(paths\.state\)\) \{/,
+    'the state file alone is the authority on how far the sweep got',
+  )
+  assert.match(
+    src, /interface CacheState \{[\s\S]*?found\?: number/,
+    'the state must record how many logs were found, so an absent file can mean zero',
+  )
+  assert.match(
+    src, /state\.found !== undefined && state\.found !== out\.length/,
+    'a logs file that disagrees with the recorded count must refuse, not resume',
+  )
+  const stateWrites = [...src.matchAll(/writeFileSync\(paths\.state,[^\n]*/g)].map((m) => m[0])
+  for (const w of stateWrites) {
+    assert.match(w, /found: out\.length/, `a state write omits the found count: ${w}`)
+  }
 })
 
 console.log(`\n${passed} passed (full suite)\n`)
