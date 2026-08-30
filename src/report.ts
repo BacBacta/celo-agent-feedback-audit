@@ -64,8 +64,10 @@ export interface AuditResult {
     archivedThisRun: number
     /** Blobs actually on disk, counted from the directory. */
     corpusSize: number
-    /** Content ids the manifest records. Equal to corpusSize unless a blob is missing. */
+    /** Distinct content ids the manifest records, stored or not. */
     corpusRecorded: number
+    /** Manifest entries whose body was recorded but deliberately not stored whole. */
+    corpusNotStored: number
     sampled: number
     sampleStride: number
     /** Which origins the inconclusive count is about, largest first. */
@@ -308,15 +310,20 @@ sampling cap it is not, and the callout above says so.
 > reasons that prove nothing — rate limits, timeouts, gateway outages. They are
 > excluded from the dead-link count above rather than folded into it. A file
 > this audit failed to reach is a question it failed to ask, not an answer.
-> The corpus holds ${num(r.evidence.corpusSize)} distinct evidence files on disk, of which
-> ${num(r.evidence.archivedThisRun)} were written by this run — the rest were archived by earlier
-> runs and reused, and a run resumed entirely from cache writes none. Under
-> \`out/evidence-corpus/\`, so every verdict above stays checkable after the
-> originals go offline.${
-  r.evidence.corpusRecorded !== undefined && r.evidence.corpusRecorded !== r.evidence.corpusSize
-    ? ` **The manifest records ${num(r.evidence.corpusRecorded)} content ids, so ${num(Math.abs(r.evidence.corpusRecorded - r.evidence.corpusSize))} of them name bytes that are no longer there.** A verdict about those is no longer checkable, and this figure says so rather than counting manifest lines as files.`
-    : ''
-}
+> The corpus under \`out/evidence-corpus/\` holds
+> ${num(r.evidence.corpusSize)} candidate documents, stored whole and keyed by the
+> keccak-256 of their bytes, so every verdict above stays checkable after the
+> originals go offline. ${num(r.evidence.archivedThisRun)} of them were written by
+> this run; the rest were archived earlier and reused, and a run resumed entirely
+> from cache writes none.
+>
+> A body that is **not** a candidate document is recorded rather than stored: its
+> hash, its true length, the URI that served it, the date, and its first 512
+> bytes. ${num(r.evidence.corpusNotStored)} manifest entries are of that kind.
+> That is deliberate and not a gap — those bytes were overwhelmingly
+> block-explorer pages served where a \`feedbackURI\` pointed at an address or a
+> transaction instead of a file, and half a megabyte of markup is a
+> disproportionate way to prove a response was not JSON. The prefix shows it.
 ${
   r.evidence.inconclusiveTopHosts.length
     ? `
@@ -549,6 +556,7 @@ export function collectEvidence(verdicts: EvidenceVerdict[], sampled: number) {
     archivedThisRun: 0,
     corpusSize: 0,
     corpusRecorded: 0,
+    corpusNotStored: 0,
     inconclusiveTopHosts: [] as { host: string; records: number; share: number }[],
     inconclusiveHosts: 0,
     sampled,

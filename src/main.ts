@@ -281,6 +281,7 @@ async function main() {
   // verdict stays checkable against bytes that are actually there.
   evidence.corpusSize = archive ? archive.onDisk : 0
   evidence.corpusRecorded = archive ? archive.size : 0
+  evidence.corpusNotStored = archive ? archive.recordedNotStored : 0
   /**
    * Which hosts the inconclusive count is actually about.
    *

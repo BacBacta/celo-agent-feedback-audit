@@ -1809,4 +1809,99 @@ await check('an empty NO_PROXY does not mask no_proxy in the digest', async () =
   else process.env.no_proxy = saveLower
 })
 
+console.log('\nthe corpus stores documents and records the rest')
+
+/**
+ * The store was 98.4% block-explorer HTML.
+ *
+ * Measured on the full-history corpus: 1,712 JSON blobs held 2.4 MB and 295
+ * HTML blobs held 150.1 MB — pages served where a feedbackURI pointed at
+ * celoscan.io instead of an evidence file. Half a megabyte of markup is a
+ * disproportionate way to prove a response was not JSON, and it crowded out the
+ * 2.4 MB that is the actual evidence. The bytes cannot simply be dropped —
+ * 38% of retrievals landed on such a body and those bytes justify every
+ * `not JSON` verdict — so the manifest keeps the identity, the true length and
+ * a bounded prefix.
+ */
+await check('a body that is not a document is recorded, not stored whole', async () => {
+  const { mkdtempSync, readFileSync, existsSync, readdirSync } = FS
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { EvidenceArchive } = await import('../src/archive.js')
+
+  const dir = mkdtempSync(join(tmpdir(), 'corpus-'))
+  const a = new EvidenceArchive(dir)
+  const enc = new TextEncoder()
+  const meta = { uri: 'https://x.test/f', url: 'https://x.test/f', observedAt: 1_700_000_000 }
+
+  const doc = a.put(enc.encode('{"feedback":"ok"}'), meta)
+  const html = a.put(enc.encode('<!doctype html><html><head><title>Address: 0xab</title>' + 'x'.repeat(4000)), meta)
+
+  assert.equal(doc.stored, true, 'a JSON body is a candidate document and is stored whole')
+  assert.equal(html.stored, false, 'an HTML body is recorded, not stored')
+  assert.equal(readdirSync(join(dir, 'blobs')).length, 1, 'exactly one blob on disk')
+
+  const lines = readFileSync(join(dir, 'manifest.jsonl'), 'utf8').trim().split('\n').map((l: string) => JSON.parse(l))
+  assert.equal(lines.length, 2, 'both retrievals are recorded')
+
+  const rec = lines.find((l: { stored?: boolean }) => l.stored === false)!
+  assert.equal(rec.contentId, html.contentId, 'the identity is the keccak of the WHOLE body, not of the prefix')
+  assert.equal(rec.bytes, 4055, 'the recorded length is the true length, not the prefix length')
+  assert.equal(rec.prefix, undefined, 'the prefix does NOT live here — the manifest has one line per retrieval')
+
+  /**
+   * The description lives once per body, not once per fetch. The same body is
+   * cited an average of twelve times in a real run, so an inline prefix wrote
+   * 1.9 MB where 0.16 MB says the same thing.
+   */
+  const described = readFileSync(join(dir, 'not-stored.jsonl'), 'utf8')
+    .trim().split('\n').map((l: string) => JSON.parse(l))
+  assert.equal(described.length, 1, 'exactly one description per distinct body')
+  assert.equal(described[0].contentId, html.contentId)
+  assert.equal(described[0].bytes, 4055, 'the description carries the true length')
+  assert.ok(described[0].prefix.startsWith('<!doctype html>'), 'the prefix shows what the body was')
+  assert.ok(described[0].prefix.length <= 512, `prefix is bounded, got ${described[0].prefix.length}`)
+
+  // Citing the same body again adds a manifest line but not a second description.
+  a.put(enc.encode('<!doctype html><html><head><title>Address: 0xab</title>' + 'x'.repeat(4000)), meta)
+  assert.equal(
+    readFileSync(join(dir, 'not-stored.jsonl'), 'utf8').trim().split('\n').length, 1,
+    'a body cited twice is described once',
+  )
+
+  // And the stored blob still hashes to its own name: content-addressing intact.
+  const { keccak256 } = await import('viem')
+  const name = readdirSync(join(dir, 'blobs'))[0]!
+  const bytes = readFileSync(join(dir, 'blobs', name))
+  assert.equal(keccak256(bytes), '0x' + name.slice(0, -4), 'a stored blob must hash to its filename')
+
+  assert.equal(a.recordedNotStored, 1)
+  assert.equal(a.onDisk, 1)
+})
+
+/**
+ * The keep/drop test must never be the parser that decides verdicts.
+ *
+ * A body that starts with `{` but does not parse is exactly the kind of thing a
+ * publisher would want the bytes of, and a storage decision must not be able to
+ * change what a record was judged to be.
+ */
+await check('malformed JSON is still a candidate document and is kept', async () => {
+  const { mkdtempSync, readdirSync } = FS
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { EvidenceArchive } = await import('../src/archive.js')
+
+  const dir = mkdtempSync(join(tmpdir(), 'corpus2-'))
+  const a = new EvidenceArchive(dir)
+  const enc = new TextEncoder()
+  const meta = { uri: 'u', url: 'u', observedAt: 1 }
+
+  assert.equal(a.put(enc.encode('{"truncated":'), meta).stored, true, 'truncated JSON is kept')
+  assert.equal(a.put(enc.encode('  \n\t[1,2,'), meta).stored, true, 'leading whitespace does not hide an array')
+  assert.equal(a.put(enc.encode('﻿{"bom":1}'), meta).stored, true, 'a BOM does not hide an object')
+  assert.equal(a.put(enc.encode('not json at all'), meta).stored, false)
+  assert.equal(readdirSync(join(dir, 'blobs')).length, 3)
+})
+
 console.log(`\n${passed} passed (full suite)\n`)
