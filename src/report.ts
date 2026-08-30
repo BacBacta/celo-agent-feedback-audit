@@ -62,13 +62,15 @@ export interface AuditResult {
      * claimed, 0 files on disk.
      */
     archivedThisRun: number
-    /** Distinct blobs in the store, across every run that has ever archived. */
+    /** Blobs actually on disk, counted from the directory. */
     corpusSize: number
+    /** Content ids the manifest records. Equal to corpusSize unless a blob is missing. */
+    corpusRecorded: number
     sampled: number
     sampleStride: number
-    /** Which hosts the inconclusive count is about, largest first. */
+    /** Which origins the inconclusive count is about, largest first. */
     inconclusiveTopHosts: { host: string; records: number; share: number }[]
-    /** Distinct hosts behind the inconclusive records. */
+    /** Distinct origins behind the inconclusive records. */
     inconclusiveHosts: number
   }
   reconciliation: ReconciliationStats
@@ -80,6 +82,9 @@ export interface AuditResult {
    * believe it. A census that cannot be re-run to the same range is an
    * assertion with a table in front of it.
    */
+  /** The semantic rules version, e.g. r8-ssrf-cid-datauri. */
+  retrievalRulesName?: string
+  /** The digest of every setting that can change a verdict. */
   retrievalRules: string
   observedRoot: string
   archivedThisRun: number
@@ -116,6 +121,16 @@ const pct = (n: number, d: number) =>
     ? '0.0%'
     : `${((requireFinite(n, 'a numerator') / d) * 100).toFixed(1)}%`
 const num = (n: number) => requireFinite(n, 'a published figure').toLocaleString('en-US')
+/**
+ * Fixed-point, refusing the same way.
+ *
+ * `requireFinite` was reached only through num() and pct(), while a dozen other
+ * figures went straight to `.toFixed()` — including every number in the
+ * Concentration section, which is where the comparability caveat lives. A
+ * missing field there rendered a bold "NaN%" beside real measurements, in the
+ * one place the report is warning a reader about false precision.
+ */
+const fx = (n: number, d = 1, where = 'a published figure') => requireFinite(n, where).toFixed(d)
 
 export function renderMarkdown(r: AuditResult): string {
   const t = r.totalFeedback
@@ -133,7 +148,7 @@ export function renderMarkdown(r: AuditResult): string {
   const burstRuns = (() => {
     const b = [...r.bursts].sort((x, y) => x.startTs - y.startTs)
     if (b.length === 0) {
-      return { isolated: 0, isolatedRecords: 0, longest: 0, longestRecords: 0 }
+      return { isolated: 0, isolatedRecords: 0, longest: 0, longestRecords: 0, longestSpanHours: 0 }
     }
     const runs: (typeof b)[] = []
     let cur: typeof b = [b[0]!]
@@ -144,11 +159,23 @@ export function renderMarkdown(r: AuditResult): string {
     runs.push(cur)
     const solo = runs.filter((run) => run.length === 1)
     const size = (run: typeof b) => run.reduce((sum, c) => sum + c.count, 0)
+    /**
+     * ONE run, described by its own attributes.
+     *
+     * `longest` and `longestRecords` were two independent `Math.max` calls, so
+     * the sentence "the longest run holds M records" paired the length of one
+     * run with the record count of another whenever they were not the same run.
+     * And the duration was `clusters × 5 minutes`, an upper bound on a shape
+     * rather than the span that was measured: it read 9.75 h for a run whose
+     * own timestamps say 12.42 h. Pick the run, then read its numbers off it.
+     */
+    const longestRun = runs.reduce((best, run) => (run.length > best.length ? run : best), runs[0]!)
     return {
       isolated: solo.length,
       isolatedRecords: solo.reduce((sum, run) => sum + size(run), 0),
-      longest: Math.max(...runs.map((run) => run.length)),
-      longestRecords: Math.max(...runs.map(size)),
+      longest: longestRun.length,
+      longestRecords: size(longestRun),
+      longestSpanHours: (longestRun[longestRun.length - 1]!.endTs - longestRun[0]!.startTs) / 3600,
     }
   })()
 
@@ -159,19 +186,27 @@ The first and last feedback records in that span are dated ${r.fromDate} and
 ${r.toDate}; the block range extends past the last record to the pinned head, so
 the two are not the same interval and the dates are not the window's edges.
 
-**Provenance.** Retrieval rules \`${r.retrievalRules}\` — the fingerprint of every
-setting that can change a verdict, so a run under different gateways, limits or
-endpoint produces a different one and cannot silently reuse these answers.
-Coverage root \`${r.observedRoot}\` over the ${num(r.totalFeedback)} records
-observed in range: re-index the same blocks, rebuild the root, and a mismatch is
-proof this census is incomplete. The evidence corpus in \`out/evidence-corpus/\`
+**Provenance.** Retrieval rules **${r.retrievalRulesName ?? '(unnamed)'}**, fingerprint
+\`${r.retrievalRules}\`. The name says which semantics decided these verdicts; the
+fingerprint digests every setting that can change one — gateways, limits,
+timeouts, endpoint, proxy routing — so a run under different settings produces a
+different digest and cannot silently reuse these answers.
+Coverage root \`${r.observedRoot}\` over the distinct
+(agentId, reviewer, feedbackIndex) keys of the ${num(r.totalFeedback)} records
+observed in range — the root commits to keys, not to a count, and the two are
+equal only while no triple repeats. Re-index the same blocks, rebuild the root,
+and a mismatch is proof this census is incomplete. The evidence corpus in \`out/evidence-corpus/\`
 holds ${num(r.evidence.corpusSize)} distinct files, content-addressed, of which
 ${num(r.archivedThisRun)} were written by this run: a verdict about a file that later
 disappears stays checkable against the bytes it judged, whichever run fetched them.
 
 ## Headline
 
-What the registry says about itself, narrowing:
+${
+  r.evidence.sampled < r.evidence.declaresURI
+    ? `> **Two of these rows are counts within a sample.** ${num(r.evidence.sampled)} of the ${num(r.evidence.declaresURI)} records declaring a file were opened, so "read and matched" and everything nested under it are lower bounds, not subsets of the row above in the ordinary sense. The Evidence chain section says which records were left unopened.\n\n`
+    : ''
+}What the registry says about itself, narrowing:
 
 | Measure | Records | Share |
 |---|---|---|
@@ -201,13 +236,17 @@ are not narrowings of the rows above and do not belong in that column:
 | Reviewer demonstrably paid the agent | **${num(r.reconciliation.backed)}** | **${pct(r.reconciliation.backed, t)}** |
 | Written by a Self Agent ID holder | **${num(r.reconciliation.humanBacked)}** | **${pct(r.reconciliation.humanBacked, t)}** |
 
-**${num(r.evidence.paymentAttributed)} against ${num(r.reconciliation.backed)}** is
-the finding. Not that payment is absent — one review in ${(t / Math.max(1, r.reconciliation.backed)).toFixed(0)} is
+${
+  r.reconciliation.backed === 0
+    ? `**${num(r.evidence.paymentAttributed)} attributable, and no reviewer-to-agent payment reconstructed either.** Both halves of the question came back empty in this window. That is a measurement, not an absence of one — see the settlement-sweep note below for whether the sweep ran at all.`
+    : `**${num(r.evidence.paymentAttributed)} against ${num(r.reconciliation.backed)}** is
+the finding. Not that payment is absent — one review in ${fx(t / r.reconciliation.backed, 0, 'the backed ratio')} is
 backed by a stablecoin transfer this audit reconstructed from chain state — but
 that essentially none of it is *declared*, and of the handful that is declared,
 none survives attribution. The evidence slot the standard provides is not being
 used by the people who are, in fact, paying. Both figures come with a
-concentration caveat below; read them together with it.
+concentration caveat below; read them together with it.`
+}
 
 | Also measured | Count |
 |---|---|
@@ -230,9 +269,16 @@ ${
   r.evidence.sampled < r.evidence.declaresURI
     ? `> **Sampled, not complete.** ${num(r.evidence.sampled)} of ${num(r.evidence.declaresURI)} records that declare a file were opened — every ${r.evidence.sampleStride}th, evenly spread across the period rather than taken from one end. Every row below from "bytes came back from the pointer" downwards is a count **within that sample**, while the percentages are of all feedback: read them as lower bounds. The ${num(r.evidence.declaresURI - r.evidence.sampled)} records that were not opened are exported with the rung \`NotChecked\` and nothing is attested for them.\n\n`
     : ''
-}Each row indented under another is a **subset** of it. Rows at the left margin
-start a new question and are not subsets of the row above — a chain of
-indistinguishable rows is how a table implies a narrowing that never happened.
+}Each row indented under another is a **subset** of it, enforced by the
+predicates that produce them rather than observed in this run's data. Rows at
+the left margin start a new question and are not subsets of the row above — a
+chain of indistinguishable rows is how a table implies a narrowing that never
+happened.
+
+One caveat the nesting cannot carry on its own: the retrieval rows count only
+records this run actually opened. When every declared file is opened, as here,
+that is the whole population and the subset relation is literal. Under a
+sampling cap it is not, and the callout above says so.
 
 | Step | Records | Share of all feedback |
 |---|---|---|
@@ -262,38 +308,42 @@ indistinguishable rows is how a table implies a narrowing that never happened.
 > reasons that prove nothing — rate limits, timeouts, gateway outages. They are
 > excluded from the dead-link count above rather than folded into it. A file
 > this audit failed to reach is a question it failed to ask, not an answer.
-> The corpus holds ${num(r.evidence.corpusSize)} distinct evidence files, of which
+> The corpus holds ${num(r.evidence.corpusSize)} distinct evidence files on disk, of which
 > ${num(r.evidence.archivedThisRun)} were written by this run — the rest were archived by earlier
 > runs and reused, and a run resumed entirely from cache writes none. Under
 > \`out/evidence-corpus/\`, so every verdict above stays checkable after the
-> originals go offline.
+> originals go offline.${
+  r.evidence.corpusRecorded !== undefined && r.evidence.corpusRecorded !== r.evidence.corpusSize
+    ? ` **The manifest records ${num(r.evidence.corpusRecorded)} content ids, so ${num(Math.abs(r.evidence.corpusRecorded - r.evidence.corpusSize))} of them name bytes that are no longer there.** A verdict about those is no longer checkable, and this figure says so rather than counting manifest lines as files.`
+    : ''
+}
 ${
   r.evidence.inconclusiveTopHosts.length
     ? `
-**And that number is about a handful of hosts, not about the web.** The ${num(r.evidence.inconclusive)} unreachable records come from ${num(r.evidence.inconclusiveHosts)} distinct hosts, distributed like this:
+**And that number is about a handful of origins, not about the web.** These ${num(r.evidence.inconclusive)} records — not \`EvidenceUnreachable\`, which is a different and disjoint rung — come from ${num(r.evidence.inconclusiveHosts)} distinct origins, distributed like this:
 
-| Host | Records | Share of inconclusive |
+| Origin | Records | Share of inconclusive |
 |---|---|---|
-${r.evidence.inconclusiveTopHosts.map((h) => `| \`${h.host}\` | ${num(h.records)} | ${(h.share * 100).toFixed(1)}% |`).join('\n')}
+${r.evidence.inconclusiveTopHosts.map((h) => `| \`${h.host}\` | ${num(h.records)} | ${fx(h.share * 100, 1, 'a self-ID share')}% |`).join('\n')}
 
-The largest carries **${(r.evidence.inconclusiveTopHosts[0]!.share * 100).toFixed(0)}%**. This audit still classes those records inconclusive rather than dead, and that is deliberate: a host that never answers has not told us its files are gone. But a reader owed the number is also owed the fact that it is concentrated in one publisher's infrastructure rather than spread across the registry.
+The largest carries **${fx(r.evidence.inconclusiveTopHosts[0]!.share * 100, 0, 'the top origin share')}%**, and the top two carry **${fx(r.evidence.inconclusiveTopHosts.slice(0, 2).reduce((a, h) => a + h.share, 0) * 100, 0, 'the top two origin shares')}%** between them. This audit still classes these records inconclusive rather than dead, and that is deliberate: a host that never answers has not told us its files are gone, and an \`ipfs://\` pointer no gateway serves may still be pinned somewhere this audit did not ask. But a reader owed the number is also owed its shape — it is not a diffuse tax on reaching the web. It is a small number of origins, of two kinds: content addressed to a network that no longer holds it, and one publisher's endpoint that never answered.
 `
     : ''
 }
 
 ## Payment backing, reconstructed${r.settlementsRan === false ? ' — not run' : ''}
 
-${r.settlementsRan === false ? '> The settlement sweep did not run for this window, so every figure in this section reads zero. It is not a finding. The headline above — whether a declared payment exists on chain — is verified per transaction hash and does not depend on it.\n' : ''}${r.settlementsRan === true && r.settlementsSeen === 0 ? '> The settlement sweep ran and found no transfers between these parties. That is a measurement, not an absence of one.\n' : ''}
-Independently of what a record declares, did this reviewer actually pay this
+${r.settlementsRan === false ? '> **The settlement sweep did not run for this window, so this section is not a measurement.** `backed` and `paidAfterReview` are zero by construction, which means the residual row below absorbs every record and reads 100% — that row is the count of questions this audit never asked, published in the slot where a negative answer normally goes. Read the whole section as unmeasured, not as negative. The headline above — whether a *declared* payment exists on chain — is verified per transaction hash and does not depend on the sweep.\n\n' : ''}${r.settlementsRan === true && r.settlementsSeen === 0 ? '> The settlement sweep ran and found no transfers between these parties. That is a measurement, not an absence of one.\n\n' : ''}Independently of what a record declares, did this reviewer actually pay this
 agent's owner, in a stablecoin, before rating it?
 
-Every record falls into exactly one of these four:
+Every record falls into exactly one of these four. The Share column is rounded
+to one decimal, so it need not read as exactly 100%:
 
 | Outcome | Records | Share |
 |---|---|---|
 | Paid the agent before reviewing it | **${num(r.reconciliation.backed)}** | **${pct(r.reconciliation.backed, t)}** |
 | Paid only *after* reviewing | ${num(r.reconciliation.paidAfterReview)} | ${pct(r.reconciliation.paidAfterReview, t)} |
-| No payment relationship found | ${num(t - r.reconciliation.backed - r.reconciliation.paidAfterReview - r.reconciliation.unresolvedAgent)} | ${pct(t - r.reconciliation.backed - r.reconciliation.paidAfterReview - r.reconciliation.unresolvedAgent, t)} |
+| ${r.settlementsRan === false ? '**Not looked for** — the sweep did not run' : 'No payment relationship found'} | ${num(t - r.reconciliation.backed - r.reconciliation.paidAfterReview - r.reconciliation.unresolvedAgent)} | ${pct(t - r.reconciliation.backed - r.reconciliation.paidAfterReview - r.reconciliation.unresolvedAgent, t)} |
 | Not askable — the agent has no owner in the registry | ${num(r.reconciliation.unresolvedAgent)} | ${pct(r.reconciliation.unresolvedAgent, t)} |
 
 The last row is what this audit could not ask the question of at all, kept
@@ -323,18 +373,18 @@ reviewer→owner relationships**, and they are distributed like this:
 | Relationship | Backed records | Share of backed |
 |---|---|---|
 ${r.reconciliation.backingTopPairs
-  .map((p) => `| \`${p.reviewer.slice(0, 10)}…\` → \`${p.owner.slice(0, 10)}…\` | ${num(p.records)} | ${(p.share * 100).toFixed(1)}% |`)
+  .map((p) => `| \`${p.reviewer.slice(0, 10)}…\` → \`${p.owner.slice(0, 10)}…\` | ${num(p.records)} | ${fx(p.share * 100, 1, 'a backing pair share')}% |`)
   .join('\n')}
 
 ${r.reconciliation.backingTopPairs.length
-  ? `The largest single relationship carries **${(r.reconciliation.backingTopPairs[0]!.share * 100).toFixed(0)}%** of the backed records, ${r.reconciliation.backingTopPairs.length > 1 ? `and the ${r.reconciliation.backingTopPairs.length} listed above carry **${(r.reconciliation.backingTopPairs.reduce((a, p) => a + p.share, 0) * 100).toFixed(0)}%** between them. ` : 'and it is the only one listed above. '}Read the headline as "a few operators pay, and almost nobody else does" rather than as a market rate.`
+  ? `The largest single relationship carries **${fx(r.reconciliation.backingTopPairs[0]!.share * 100, 0, 'the top backing share')}%** of the backed records, ${r.reconciliation.backingTopPairs.length > 1 ? `and the ${r.reconciliation.backingTopPairs.length} listed above carry **${fx(r.reconciliation.backingTopPairs.reduce((a, p) => a + p.share, 0) * 100, 0, 'the listed backing share')}%** between them. ` : 'and it is the only one listed above. '}Read the headline as "a few operators pay, and almost nobody else does" rather than as a market rate.`
   : ''}
 
 ### The same question, asked of the Self-ID figure
 
 ${num(r.reconciliation.humanBacked)} records were written by an address holding a
 Self Agent ID. That is **${num(r.reconciliation.humanBackedReviewers)} distinct
-addresses**${r.reconciliation.humanBackedTop.length ? `, of which the largest wrote ${num(r.reconciliation.humanBackedTop[0]!.records)} — ${(r.reconciliation.humanBackedTop[0]!.share * 100).toFixed(0)}% of the figure` : ''}.
+addresses**${r.reconciliation.humanBackedTop.length ? `, of which the largest wrote ${num(r.reconciliation.humanBackedTop[0]!.records)} — ${fx(r.reconciliation.humanBackedTop[0]!.share * 100, 0, 'the top self-ID share')}% of the figure` : ''}.
 Read it as "a handful of verified operators are prolific", not as
 "${pct(r.reconciliation.humanBacked, t)} of reviews came from a verified human",
 which is what the percentage alone suggests.
@@ -342,14 +392,14 @@ which is what the percentage alone suggests.
 | Self-ID reviewer | Records | Share of the figure |
 |---|---|---|
 ${r.reconciliation.humanBackedTop
-  .map((h) => `| \`${h.reviewer.slice(0, 10)}…\` | ${num(h.records)} | ${(h.share * 100).toFixed(1)}% |`)
+  .map((h) => `| \`${h.reviewer.slice(0, 10)}…\` | ${num(h.records)} | ${fx(h.share * 100, 1, 'a self-ID share')}% |`)
   .join('\n')}
 
 ## Concentration
 
-- Gini over **reviews per reviewer**: **${r.concentration.gini.toFixed(3)}**
-- The 10 most prolific reviewers wrote: **${(r.concentration.topTenShare * 100).toFixed(1)}%** of all feedback
-- Reviewers who reviewed exactly once: **${(r.concentration.oneShotReviewerRate * 100).toFixed(1)}%**
+- Gini over **reviews per reviewer**: **${fx(r.concentration.gini, 3, 'gini')}**
+- The 10 most prolific reviewers wrote: **${fx(r.concentration.topTenShare * 100, 1, 'topTenShare')}%** of all feedback
+- Reviewers who reviewed exactly once: **${fx(r.concentration.oneShotReviewerRate * 100, 1, 'oneShotReviewerRate')}%**
 - Most feedback from a single address: **${num(r.concentration.maxBySingleReviewer)}**
 
 > **These are not comparable to the arXiv ERC-8004 study's figures, and an
@@ -362,7 +412,7 @@ ${r.reconciliation.humanBackedTop
 > reviewer rate at all.
 >
 > The proximity is what makes the claim dangerous rather than merely wrong:
-> ${(r.concentration.topTenShare * 100).toFixed(1)}% beside that study's ">70%"
+> ${fx(r.concentration.topTenShare * 100, 1, 'topTenShare')}% beside that study's ">70%"
 > reads as corroboration between two measurements that never met.
 >
 > Its headline — 73.6%, 59.2% and 90.6% of reviewers exhibiting coordinated
@@ -394,12 +444,11 @@ continuous operation look like repeated bursting. Separating the two:
 | Isolated — no other cluster within 5 minutes | ${num(burstRuns.isolated)} | ${num(burstRuns.isolatedRecords)} |
 | Inside a run of consecutive clusters | ${num(r.bursts.length - burstRuns.isolated)} | ${num(burstEvents - burstRuns.isolatedRecords)} |
 
-The longest unbroken run is **${num(burstRuns.longest)} consecutive clusters**
-holding ${num(burstRuns.longestRecords)} records — on the order of
-${(burstRuns.longest * 5 / 60).toFixed(0)} hours of continuous
-five-or-more-per-five-minutes activity, which reads as an operator running
-rather than as a spike. Only the isolated clusters are the shape the word
-"burst" describes.
+${
+  burstRuns.longest > 1
+    ? `The longest unbroken run is **${num(burstRuns.longest)} consecutive clusters** holding ${num(burstRuns.longestRecords)} records, spanning ${fx(burstRuns.longestSpanHours, 1, 'the longest run span')} hours from the first cluster's start to the last one's end — continuous five-or-more-per-five-minutes activity, which reads as an operator running rather than as a spike. Only the isolated clusters are the shape the word "burst" describes.`
+    : 'No cluster has a neighbour within five minutes, so every one of them stands alone: here the word "burst" describes the whole figure.'
+}
 
 ## Method and limits
 
@@ -486,7 +535,11 @@ export function collectEvidence(verdicts: EvidenceVerdict[], sampled: number) {
         v.fetched && v.jsonValid && v.hashMatches && v.claimsPayment && v.txExists &&
         v.paymentVerified && v.paymentAttributed,
     ).length,
-    partyMismatch: verdicts.filter((v) => v.partiesContradicted).length,
+    partyMismatch: verdicts.filter(
+      (v) =>
+        v.fetched && v.jsonValid && v.hashMatches && v.claimsPayment && v.txExists &&
+        v.paymentVerified && v.partiesContradicted,
+    ).length,
     foreignChain: verdicts.filter((v) => v.claimsPayment && !v.onQueryableChain).length,
     // Counted apart from `fetched` on purpose: these are the records the audit
     // failed to reach, not the records it found dead. Reporting them inside the
@@ -495,6 +548,7 @@ export function collectEvidence(verdicts: EvidenceVerdict[], sampled: number) {
     contentAddressed: verdicts.filter((v) => v.contentId !== null).length,
     archivedThisRun: 0,
     corpusSize: 0,
+    corpusRecorded: 0,
     inconclusiveTopHosts: [] as { host: string; records: number; share: number }[],
     inconclusiveHosts: 0,
     sampled,

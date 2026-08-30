@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync, existsSync, readFileSync, appendFileSync } from 'node:fs'
+import { mkdirSync, writeFileSync, existsSync, readFileSync, appendFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { keccak256 } from 'viem'
 
@@ -79,6 +79,23 @@ export class EvidenceArchive {
    */
   get size(): number {
     return this.seen.size
+  }
+
+  /**
+   * Blobs actually present in the store, counted from the directory.
+   *
+   * `size` is the manifest's view: every content id any run has ever recorded.
+   * The report's sentence is a promise that a verdict stays checkable against
+   * the bytes it judged, and only a file on disk keeps that promise — a blob
+   * deleted under a manifest line that survives it would still be counted.
+   * Cheap to check (one readdir), so it is checked rather than assumed.
+   */
+  get onDisk(): number {
+    try {
+      return readdirSync(join(this.dir, 'blobs')).filter((f) => f.endsWith('.bin')).length
+    } catch {
+      return 0
+    }
   }
 
   /** Blobs this run actually wrote to disk. Zero on a fully cached run. */

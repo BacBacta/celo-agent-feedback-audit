@@ -268,6 +268,21 @@ export const RETRIEVAL_RULES = 'r8-ssrf-cid-datauri'
  *     path and whether address pinning happens at all. Each of those changes
  *     what a verdict means, and none of them was named.
  */
+/**
+ * The first of these environment variables that is set to a non-empty value.
+ *
+ * Kept identical to `envProxy` in net/fetch-evidence.ts. It cannot be imported
+ * from there — that module imports this one — so the duplication is deliberate
+ * and guarded by a test rather than left to drift.
+ */
+export function firstSet(...names: string[]): string {
+  for (const n of names) {
+    const v = (process.env[n] ?? '').trim()
+    if (v) return v
+  }
+  return ''
+}
+
 export function retrievalFingerprint(): string {
   const parts = [
     `rules=${RETRIEVAL_RULES}`,
@@ -303,7 +318,22 @@ export function retrievalFingerprint(): string {
         if (!v) return `${k}=`
         try { return `${k}=${new URL(v).hostname}` } catch { return `${k}=set` }
       }).join(',')}`,
-    `noproxy=${(process.env.NO_PROXY ?? process.env.no_proxy ?? '').trim()}`,
+    /**
+     * Resolved exactly as the fetcher resolves it, or the digest lies.
+     *
+     * This was `NO_PROXY ?? no_proxy`, and `??` only skips null and undefined.
+     * An exported-but-empty `NO_PROXY=""` therefore won and the lowercase
+     * variable was never read — while `envProxy()` in net/fetch-evidence.ts
+     * skips empty strings and honours `no_proxy`. So a run with
+     * `NO_PROXY="" no_proxy=gateway.pinata.cloud` fetched the primary IPFS
+     * gateway direct with address pinning, and a run with neither set fetched
+     * it through the proxy, and both produced fingerprint 4ffcef7480884a56 and
+     * shared one verdict cache. That is the precise failure this fingerprint
+     * exists to make impossible, introduced by the commit that made the
+     * fingerprint stable. `firstSet` mirrors envProxy; a test asserts they
+     * still agree.
+     */
+    `noproxy=${firstSet('NO_PROXY', 'no_proxy')}`,
   ].join(';')
   return createHash('sha256').update(parts).digest('hex').slice(0, 16)
 }

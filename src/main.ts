@@ -1,7 +1,7 @@
 import { mkdirSync, writeFileSync } from 'node:fs'
 import type { Address } from 'viem'
 import { latestBlock, assertDeterministicLogs } from './rpc.js'
-import { AUDIT_VERSION, retrievalFingerprint } from './config.js'
+import { AUDIT_VERSION, RETRIEVAL_RULES, retrievalFingerprint } from './config.js'
 import { BLOCKS_PER_DAY, REGISTRY_DEPLOY_BLOCK, REPUTATION_REGISTRY, NEW_FEEDBACK_EVENT } from './config.js'
 import { SETTLEMENT_TOKENS, MAX_SETTLEMENT_PASSES, settlementPasses } from './config.js'
 import { loadFeedback } from './sources/feedback.js'
@@ -277,7 +277,10 @@ async function main() {
   // Files this run actually wrote, as distinct from verdicts carrying a
   // content id — a warm resume cache fills the second without fetching.
   evidence.archivedThisRun = archive ? archive.written : 0
-  evidence.corpusSize = archive ? archive.size : 0
+  // Files on disk, not manifest lines: the corpus figure is a promise that a
+  // verdict stays checkable against bytes that are actually there.
+  evidence.corpusSize = archive ? archive.onDisk : 0
+  evidence.corpusRecorded = archive ? archive.size : 0
   /**
    * Which hosts the inconclusive count is actually about.
    *
@@ -290,16 +293,36 @@ async function main() {
    * gone but we decline to say so".
    */
   {
+    /**
+     * A CID is not a host.
+     *
+     * This bucketed by `new URL(uri).hostname`, and for `ipfs://Qm…` that is
+     * the content identifier — so every unresolved CID became its own
+     * "publisher" and the count read 982 distinct hosts. The honest answer is
+     * five origins, one of which carries 45%: an `ipfs://` pointer is served by
+     * whichever gateway answers, so the gateway set is the origin and the CID
+     * is the thing being asked for. Publishing 982 made a concentrated failure
+     * look like a diffuse one, which is the same defect this report exists to
+     * object to, committed in the code that reports it.
+     */
     const perHost = new Map<string, number>()
     for (const [rec, v] of verdictByRecord) {
       if (!v.inconclusive) continue
-      let host: string
-      try {
-        host = new URL(rec.feedbackURI).hostname || '(no host)'
-      } catch {
-        host = '(unparseable URI)'
+      const uri = rec.feedbackURI ?? ''
+      const scheme = uri.includes(':') ? uri.slice(0, uri.indexOf(':')).toLowerCase() : ''
+      let origin: string
+      if (scheme === 'http' || scheme === 'https') {
+        try {
+          origin = new URL(uri).hostname || '(no host)'
+        } catch {
+          origin = '(unparseable URI)'
+        }
+      } else if (scheme) {
+        origin = `${scheme}:// (no gateway served it)`
+      } else {
+        origin = '(no scheme)'
       }
-      perHost.set(host, (perHost.get(host) ?? 0) + 1)
+      perHost.set(origin, (perHost.get(origin) ?? 0) + 1)
     }
     const total = [...perHost.values()].reduce((a, b) => a + b, 0) || 1
     evidence.inconclusiveTopHosts = [...perHost.entries()]
@@ -327,6 +350,17 @@ async function main() {
     bursts,
     settlementsSeen: settlements.length,
     settlementsRan: ranSettlements,
+    /**
+     * Both halves: what the rules ARE, and the digest that proves settings equality.
+     *
+     * This published only the fingerprint under a label reading "retrieval
+     * rules" — a hex digest that proves two runs shared their settings and
+     * tells a reader nothing about which semantics decided the verdicts. The
+     * name is the half a human can act on; the digest is the half a machine
+     * can compare. Publishing one under the other's label is the defect this
+     * report is about.
+     */
+    retrievalRulesName: RETRIEVAL_RULES,
     retrievalRules: rules,
     observedRoot: merkleRoot(feedback.map((f) => recordKey(f.agentId, f.reviewer, f.feedbackIndex))),
     archivedThisRun: archive ? archive.written : 0,
@@ -590,6 +624,7 @@ async function main() {
        * came to republish verdicts decided under rules that had since been
        * corrected, and looked entirely legitimate doing it.
        */
+      retrievalRulesName: RETRIEVAL_RULES,
       retrievalRules: rules,
       producedAt: new Date().toISOString(),
     }, null, 2),

@@ -94,18 +94,29 @@ npm run typecheck
 
 ## Published runs
 
-Completed full-history runs are snapshotted under [`docs/`](docs/), named by the
-block they were pinned to and the retrieval rules that decided their verdicts —
-`audit-<toBlock>-<rules>.md`, with the machine-readable result beside it.
+**Latest:** [blocks 58,396,729–76,199,590](docs/audit-58396729-76199590-r8-ssrf-cid-datauri-c938a5c3008b50a2.md)
+— 27,520 feedback records, February to August 2026, every declared evidence file
+opened. ([machine-readable](docs/audit-58396729-76199590-r8-ssrf-cid-datauri-c938a5c3008b50a2.json))
 
-Both halves of that name matter. Two runs over different block ranges are
-different measurements and must not share a filename; two runs over the same
-range under different retrieval rules are also different measurements, because
-what counts as a dead file is a property of how it was asked for. `npm run
-publish-report` writes the snapshot, refuses an output missing either field,
-and refuses to overwrite an existing snapshot whose content differs — the same
-range under the same rules producing two different reports is a finding about
-this tool, not a file to replace.
+Completed runs are snapshotted under [`docs/`](docs/) as
+`audit-<fromBlock>-<toBlock>-<rules>-<fingerprint>.md`, with the
+machine-readable result beside it.
+
+Every part of that name is load-bearing. Two runs over different block ranges
+are different measurements and must not share a filename — including a windowed
+run and a full-history run that happen to end at the same head, which is why
+both endpoints are there. Two runs over the same range under different retrieval
+rules are also different measurements, because what counts as a dead file is a
+property of how it was asked for; the rules *name* says which semantics decided
+the verdicts and the *fingerprint* digests every setting that could change one.
+
+`npm run publish-report` writes the snapshot and refuses in three cases: an
+output missing its provenance fields, an `audit.md` that does not mention the
+coverage root and block range its `audit.json` records — which is how a pair
+from two different runs is caught — and an existing snapshot whose content
+differs, because the same range under the same rules producing two different
+reports is a finding about this tool, not a file to replace. A refusal writes
+nothing at all.
 
 ## Checking the audit's own answers
 

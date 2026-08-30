@@ -10,7 +10,7 @@ import type { Address, Hex } from 'viem'
 import { gini, concentration, findBursts } from '../src/analysis/concentration.js'
 import { reconcile, summarize } from '../src/analysis/reconcile.js'
 import { extractPaymentClaim } from '../src/analysis/payment.js'
-import { classifyFailure } from '../src/rpc.js'
+import { classifyFailure, resumeDecision } from '../src/rpc.js'
 import { collectEvidence, renderMarkdown } from '../src/report.js'
 import { pool } from '../src/pool.js'
 import type { FeedbackRecord } from '../src/sources/feedback.js'
@@ -1278,8 +1278,21 @@ await check('changing what a verdict means starts a new cache, it does not inher
   for (const f of DECIDERS) h.update(FS.readFileSync(f))
   const digest = h.digest('hex').slice(0, 16)
   /**
-   * a4019c3f… — rpc.ts gained a filter fingerprint and a found-count on the
-   * log cache.
+   * 38c62104… — rpc.ts extracted resumeDecision() and fixed which paths stamp
+   * the filter fingerprint; config.ts fixed the NO_PROXY
+   * reading in the digest.
+   *
+   * The judgment this guard asks for. Cached evidence verdicts stay valid and
+   * RETRIEVAL_RULES stays at r8. The rpc.ts change is inside getLogsChunked,
+   * which indexes events; a verdict is decided by fetch-evidence, evidence and
+   * payment, and payment verification reads a transaction receipt, not a log
+   * range. The config.ts change touches only what retrievalFingerprint() hashes,
+   * never the fetch path — firstSet() is used nowhere else — so no verdict
+   * moves. It was verified directly that this environment's fingerprint is
+   * unchanged at c938a5c3008b50a2, so the 10,469 cached verdicts still answer
+   * the question they were asked. What the fix does change is that an
+   * environment which previously COLLIDED with ours now gets its own cache,
+   * which is the fingerprint's whole purpose.
    *
    * The judgment this guard asks for: cached evidence verdicts stay valid. The
    * change is inside `getLogsChunked`, which indexes events; an evidence
@@ -1291,7 +1304,7 @@ await check('changing what a verdict means starts a new cache, it does not inher
    * the right side to err on.
    */
   assert.equal(
-    digest, 'a4019c3fe5f82268',
+    digest, '38c62104704b1767',
     `retrieval semantics changed (digest ${digest}). Bump RETRIEVAL_RULES ` +
       `(currently "${RETRIEVAL_RULES}") and update this digest, or cached verdicts ` +
       'decided under the old rules will be republished as a fresh measurement.',
@@ -1355,29 +1368,62 @@ check('every module the source imports is one the build actually ships', () => {
  * arriving can support. 1,410 of those 3,560 were not documents at all.
  */
 check('no ladder row publishes a measure another row already published', () => {
-  const { readFileSync } = FS
-  const src: string = readFileSync('src/report.ts', 'utf8')
-  const table = src.slice(
-    src.indexOf('| Step | Records | Share of all feedback |'),
-    src.indexOf('> **What \\`EvidenceUnreachable\\` contains.**'),
-  )
-  assert.ok(table.length > 200, 'the evidence ladder was not found in report.ts')
+  /**
+   * Rendered, not read.
+   *
+   * This used to slice src/report.ts between two string markers and match
+   * `r.evidence.<field>` per line. An adversarial review defeated it in one
+   * line: `const f = r.evidence.fetched` printed twice matches nothing, and the
+   * exact historical defect — 3,560 published as two rungs of a chain — came
+   * back green. It was also silent if the markers ever moved.
+   *
+   * So the table is RENDERED with a fixture in which every evidence field holds
+   * a distinct value, and the assertion is on the output: two rows carrying the
+   * same number are two rows reading the same field, whatever the source spells.
+   */
+  const distinct: Record<string, number> = {}
+  let next = 1_000_000
+  for (const k of Object.keys(collectEvidence([], 0))) distinct[k] = next++
+  // Keep the nesting arithmetically sane so no row is a rounding artefact.
+  const ev = { ...distinct, sampled: distinct.declaresURI!, sampleStride: 1, inconclusiveTopHosts: [], inconclusiveHosts: 3 }
+
+  const r = {
+    fromBlock: 1, toBlock: 2, fromDate: 'a', toDate: 'b',
+    totalFeedback: 9_000_000, revokedFeedback: 0, distinctAgentsRated: 1, registeredAgents: 2,
+    evidence: ev,
+    reconciliation: {
+      total: 1, backed: 3, backedRate: 0, paidAfterReview: 5, selfDealing: 7,
+      humanBacked: 11, humanBackedRate: 0, backedAndHumanBacked: 13, unresolvedAgent: 17,
+      backingTopPairs: [], backingPairs: 19, humanBackedTop: [], humanBackedReviewers: 23,
+    },
+    concentration: { distinctReviewers: 29, gini: 0.5, topTenShare: 0.5, oneShotReviewerRate: 0.5, maxBySingleReviewer: 31 },
+    bursts: [], settlementsSeen: 37, settlementsRan: true,
+    retrievalRules: 'x', retrievalRulesName: 'r-test', observedRoot: '0x0',
+    archivedThisRun: 0, selfVerifiedReviewers: 0,
+  }
+
+  const md = renderMarkdown(r as never)
+  const ladder = md.slice(md.indexOf('| Step | Records |'), md.indexOf('> **What `EvidenceUnreachable` contains.**'))
+  assert.ok(ladder.length > 200, 'the rendered evidence ladder was not found')
 
   const seen = new Map<string, string>()
-  for (const line of table.split('\n')) {
+  let rows = 0
+  for (const line of ladder.split('\n')) {
     if (!line.startsWith('| ') || line.startsWith('| Step') || line.startsWith('|---')) continue
-    const label = line.split('|')[1]!.trim()
-    const field = /r\.evidence\.([A-Za-z]+)/.exec(line)?.[1]
-    if (!field) continue
-    const prior = seen.get(field)
+    const cells = line.split('|').map((c) => c.trim())
+    const label = cells[1]!
+    const value = cells[2]!.replace(/[*,]/g, '')
+    if (!/^\d+$/.test(value)) continue
+    rows++
+    const prior = seen.get(value)
     assert.ok(
       prior === undefined,
-      `the ladder prints r.evidence.${field} as both "${prior}" and "${label}" — ` +
-        'one number cannot be two steps of a chain',
+      `the ladder prints ${value} as both "${prior}" and "${label}" — ` +
+        'one measurement cannot be two steps of a chain',
     )
-    seen.set(field, label)
+    seen.set(value, label)
   }
-  assert.ok(seen.size >= 5, `only ${seen.size} ladder rows were parsed; the guard is not reading the table`)
+  assert.ok(rows >= 8, `only ${rows} ladder rows were parsed; the guard is not reading the table`)
 })
 
 /**
@@ -1393,12 +1439,20 @@ check('a document that parsed is a document whose bytes arrived', () => {
     paymentVerified: false, paymentAttributed: false, partiesContradicted: false,
     onQueryableChain: true, contentId: null,
   })
+  /**
+   * The witness has to include jsonValid && !fetched.
+   *
+   * The old fixture was [tt, tf, ff, tt] — no verdict of that shape — so
+   * reverting `parsed` to the un-nested `filter(v => v.jsonValid)` produced the
+   * identical 3 and 2 and every assertion passed. A test whose fixture cannot
+   * distinguish the fixed code from the broken code is not a test.
+   */
   const e = collectEvidence(
-    [v(true, true), v(true, false), v(false, false), v(true, true)] as never[],
+    [v(false, true), v(false, true), v(true, false), v(true, true)] as never[],
     4,
   )
-  assert.equal(e.fetched, 3)
-  assert.equal(e.parsed, 2)
+  assert.equal(e.fetched, 2, 'two verdicts have fetched')
+  assert.equal(e.parsed, 1, 'only one has BOTH — un-nested this reads 3')
   assert.ok(e.parsed <= e.fetched, 'parsed must never exceed fetched')
 })
 
@@ -1430,6 +1484,43 @@ check('a missing figure stops the report instead of printing NaN', () => {
     /refusing to publish/,
     'a missing field must stop the render, not become "NaN" in a column of real numbers',
   )
+
+  /**
+   * And every OTHER numeric path, not just the one that happens to use num().
+   *
+   * requireFinite was reached only through num() and pct(). A dozen figures
+   * went straight to .toFixed() — among them every number in the Concentration
+   * section, which is where the caveat about false precision lives. Deleting
+   * one of those rendered successfully and printed a bold "NaN%" beside real
+   * measurements. So the guard is asserted field by field, over every field the
+   * template reads, rather than over the one that was convenient to delete.
+   */
+  const complete = () => JSON.parse(JSON.stringify({
+    ...r, evidence: { ...collectEvidence([], 0), claimsPaymentAnyHash: 0 },
+  }))
+  assert.doesNotThrow(() => renderMarkdown(complete() as never), 'the complete fixture must render')
+
+  for (const path of [
+    ['concentration', 'gini'],
+    ['concentration', 'topTenShare'],
+    ['concentration', 'oneShotReviewerRate'],
+    ['concentration', 'maxBySingleReviewer'],
+    ['concentration', 'distinctReviewers'],
+    ['evidence', 'inconclusive'],
+    ['evidence', 'corpusSize'],
+    ['evidence', 'parsed'],
+    ['evidence', 'hashMatched'],
+    ['reconciliation', 'humanBacked'],
+    ['reconciliation', 'unresolvedAgent'],
+  ] as const) {
+    const broken = complete()
+    delete (broken as Record<string, Record<string, unknown>>)[path[0]]![path[1]]
+    assert.throws(
+      () => renderMarkdown(broken as never),
+      /refusing to publish/,
+      `deleting ${path[0]}.${path[1]} must stop the render — it rendered "NaN" instead`,
+    )
+  }
 })
 
 /**
@@ -1483,103 +1574,6 @@ await check('an empty work list and a width wider than the list are both fine', 
   assert.equal(calls, 2, 'width is clamped to the number of items, and every item still runs')
 })
 
-console.log('\na cached log range remembers which filter it answered')
-
-/**
- * The settlement sweep batches reviewers 2,000 at a time and cached each batch
- * under `settle-<token>-<batchIndex>-<fromBlock>`. The batch *index* is in the
- * key; the addresses in it are not. Add reviewers to the registry, re-run, and
- * batch 0 holds a different set while reading the same file — so the sweep
- * republishes the previous run's transfers as this run's answer, and every
- * payment-backed figure downstream is computed over the wrong population.
- */
-check('the log cache records the filter it was fetched for, not just the range', () => {
-  const src: string = FS.readFileSync('src/rpc.ts', 'utf8')
-
-  assert.match(
-    src, /interface CacheState \{[^}]*query\?: string/,
-    'the cache state must carry a fingerprint of the filter arguments',
-  )
-  assert.match(
-    src, /state\.query !== undefined && state\.query !== queryTag/,
-    'a resume must compare the stored fingerprint against this run’s filter',
-  )
-  assert.match(
-    src, /was written for a different filter/,
-    'a mismatch must refuse, not warn-and-continue: continuing publishes another run’s logs',
-  )
-  const stateWrites = [...src.matchAll(/writeFileSync\(paths\.state,[^\n]*/g)].map((m) => m[0])
-  assert.ok(stateWrites.length > 0, 'no state write found in rpc.ts — the guard is not reading the file')
-  for (const w of stateWrites) {
-    assert.match(
-      w, /query: queryTag/,
-      `a state write omits the fingerprint, so the next run has nothing to compare: ${w}`,
-    )
-  }
-  /**
-   * And the catch that swallows an unreadable cache must not swallow this.
-   * The refusal is raised inside the same try block it guards.
-   */
-  assert.match(
-    src, /m\.includes\('was written for a different filter'\)[\s\S]{0,80}throw err/,
-    'the unreadable-cache catch must re-throw a filter mismatch',
-  )
-})
-
-await check('the filter fingerprint distinguishes address sets and does not sort them', async () => {
-  const { createHash } = await import('node:crypto')
-  const tag = (args: unknown) =>
-    createHash('sha256')
-      .update(JSON.stringify(args ?? null, (_k, v) => (typeof v === 'bigint' ? v.toString() : v)))
-      .digest('hex')
-      .slice(0, 16)
-
-  const a = tag({ from: ['0xaa', '0xbb'] })
-  const b = tag({ from: ['0xaa', '0xcc'] })
-  const reordered = tag({ from: ['0xbb', '0xaa'] })
-  assert.notEqual(a, b, 'a different address set must be a different fingerprint')
-  assert.notEqual(
-    a, reordered,
-    'reordering changes which addresses land in which batch, so it must not be hidden by sorting',
-  )
-  assert.notEqual(tag(undefined), a, 'an unfiltered sweep is not the same query as a filtered one')
-})
-
-/**
- * A sweep that found nothing must be able to prove it ran.
- *
- * Resuming required the state file AND the logs file to exist. A batch that
- * matched no transfers never created a logs file, so its state file — saying
- * the entire range had been swept — was ignored and the range re-swept from
- * scratch, every run, forever. Two full-history passes over this registry are
- * in exactly that position: about forty minutes each, correctly returning
- * zero, repeated indefinitely because the evidence of the work was an absent
- * file.
- */
-check('a completed sweep that found nothing is not re-swept from scratch', () => {
-  const src: string = FS.readFileSync('src/rpc.ts', 'utf8')
-
-  assert.doesNotMatch(
-    src, /existsSync\(paths\.state\) && existsSync\(paths\.logs\)/,
-    'the resume must not require a logs file: an empty result never writes one',
-  )
-  assert.match(
-    src, /existsSync\(paths\.state\)\) \{/,
-    'the state file alone is the authority on how far the sweep got',
-  )
-  assert.match(
-    src, /interface CacheState \{[\s\S]*?found\?: number/,
-    'the state must record how many logs were found, so an absent file can mean zero',
-  )
-  assert.match(
-    src, /state\.found !== undefined && state\.found !== out\.length/,
-    'a logs file that disagrees with the recorded count must refuse, not resume',
-  )
-  const stateWrites = [...src.matchAll(/writeFileSync\(paths\.state,[^\n]*/g)].map((m) => m[0])
-  for (const w of stateWrites) {
-    assert.match(w, /found: out\.length/, `a state write omits the found count: ${w}`)
-  }
-})
 
 /**
  * The report must not claim comparability it does not have.
@@ -1603,16 +1597,61 @@ check('no claim of comparability with a study whose measures differ', () => {
     ['src/analysis/concentration.ts', FS.readFileSync('src/analysis/concentration.ts', 'utf8')],
   ] as const
 
+  /**
+   * The phrase scan asserted nothing.
+   *
+   * It looked for three literal strings that the fix had already removed, so
+   * the loop body never ran; and its negation window was ±400 characters
+   * matched against /not|never|used to|no longer/, which any surrounding prose
+   * satisfies. A guard whose search finds nothing is not protecting anything.
+   *
+   * What the guard is actually for: a claim of equivalence between this
+   * audit's concentration figures and the cited study's. So it forbids the
+   * comparative vocabulary outright, anywhere in these files, unless the
+   * sentence is one of the explicit disclaimers below.
+   */
+  const FORBIDDEN = [
+    /directly comparable/i,
+    /\bsame measures\b/i,
+    /comparable to the published/i,
+    /numbers are comparable/i,
+    /replicat\w* of (?:that|the arxiv)/i,
+  ]
+  /**
+   * Prose wraps, and comment lines carry a ` * ` prefix, so a phrase that reads
+   * as one sentence is several lines with punctuation between its words. The
+   * first version of this guard missed a disclaimer that was plainly present
+   * for exactly that reason. Normalise before matching.
+   */
+  const flat = (t: string) => t.replace(/^\s*\*\s?/gm, ' ').replace(/\s+/g, ' ')
+  const ALLOWED_CONTEXT =
+    /not (?:the arxiv|that study'?s|its) measures|are not comparable|not comparable to|is not a Celo replication|must not be described as producing a comparable|used to say they were|used to imply it was/i
+
   for (const [name, body] of claims) {
-    for (const phrase of ['directly comparable', 'the same measures', 'same measures as']) {
-      const at = body.toLowerCase().indexOf(phrase)
-      if (at === -1) continue
-      const around = body.slice(Math.max(0, at - 400), at + 400)
+    const norm = flat(body)
+    for (const re of FORBIDDEN) {
+      const m = re.exec(norm)
+      if (!m) continue
+      const around = norm.slice(Math.max(0, m.index - 260), m.index + 260)
       assert.ok(
-        /not|never|used to|no longer/i.test(around),
-        `${name} claims "${phrase}" near the study citation without a negation: ${around.slice(0, 200)}`,
+        ALLOWED_CONTEXT.test(around),
+        `${name} uses "${m[0]}" about the cited study without an explicit ` +
+          `disclaimer beside it:\n…${around}…`,
       )
     }
+  }
+
+  /**
+   * And the disclaimer itself must still be there, phrased as a correction of
+   * a claim that was made — not merely absent, which a rewrite could achieve
+   * while reintroducing the equivalence somewhere else in the file.
+   */
+  for (const [name, body] of claims) {
+    if (!/arxiv|2606\.26028/i.test(body)) continue
+    assert.match(
+      flat(body), ALLOWED_CONTEXT,
+      `${name} cites the study without stating that its measures are not this audit's`,
+    )
   }
 
   const report = claims[0][1]
@@ -1624,6 +1663,150 @@ check('no claim of comparability with a study whose measures differ', () => {
     report, /agents owned per wallet/,
     "the report must name what the study's Gini actually measures, not merely disclaim comparability",
   )
+})
+
+console.log('\nwhat to do with a cache on disk')
+
+/**
+ * Every branch of the resume decision, enumerated.
+ *
+ * These replace two guards that asserted against the SHAPE OF THE SOURCE with
+ * regexes. An adversarial review showed both were defeated by refactoring that
+ * left the defect in place — a guard that reads the source is a guard against
+ * one spelling, not against a behaviour. Four regressions lived in this
+ * decision and every one was a case nobody had enumerated, so it is enumerated
+ * here instead.
+ */
+const D = (over: Partial<Parameters<typeof resumeDecision>[0]> = {}) =>
+  resumeDecision({
+    state: { completedUpTo: '500', query: 'Q', found: 10 },
+    fromBlock: 1n, toBlock: 1000n, queryTag: 'Q', filtered: true,
+    logsPresent: true, logLines: 10, cacheKey: 'settle-X-0-1',
+    ...over,
+  })
+
+check('a cache fetched for a different filter is refused, not resumed', () => {
+  const d = D({ state: { completedUpTo: '500', query: 'OTHER', found: 10 } })
+  assert.equal(d.action, 'refuse')
+  assert.match((d as { reason: string }).reason, /different filter/)
+})
+
+check('an over-full logs file is the documented resume overlap, not truncation', () => {
+  // The append precedes the state write, so a kill between them leaves MORE
+  // lines than `found`. dedupeLogs absorbs it. A strict inequality made this
+  // handled case fatal, on caches up to 280 MB.
+  const d = D({ logLines: 13, state: { completedUpTo: '500', query: 'Q', found: 10 } })
+  assert.equal(d.action, 'resume', 'more lines than recorded must resume, not refuse')
+})
+
+check('a short logs file is a real loss and is refused', () => {
+  const d = D({ logLines: 7, state: { completedUpTo: '500', query: 'Q', found: 10 } })
+  assert.equal(d.action, 'refuse')
+  assert.match((d as { reason: string }).reason, /holds only 7/)
+})
+
+check('a state that records found:0 proves an empty sweep with no logs file', () => {
+  const d = D({ logsPresent: false, logLines: 0, state: { completedUpTo: '500', query: 'Q', found: 0 } })
+  assert.equal(d.action, 'resume', 'an empty sweep never writes a logs file; found:0 is its proof')
+})
+
+check('a legacy state with no logs file is NOT proof of an empty sweep', () => {
+  // This is how revoked-*.state and settle-USAT-1-*.state sit on disk right now.
+  // Reading them as "swept the full history, found nothing" publishes an
+  // unasked question as an answer — and destroys the documented way to force a
+  // re-sweep, which was to delete the .jsonl.
+  const d = D({ logsPresent: false, logLines: 0, state: { completedUpTo: '500' }, filtered: false })
+  assert.equal(d.action, 'resweep')
+  assert.match(d.warn ?? '', /not proof of an empty sweep/)
+})
+
+check('a declined resume truncates the stale logs it is not using', () => {
+  // Pin below completedUpTo: the window check fails, cursor stays at fromBlock,
+  // and the fetch loop appends. Leaving the old file merges two sweeps while
+  // `found` counts only the fresh half.
+  const d = D({ toBlock: 100n, state: { completedUpTo: '500', query: 'Q', found: 10 } })
+  assert.equal(d.action, 'resweep')
+  assert.equal(d.truncateLogs, true, 'a file we are not resuming from must not survive to be appended to')
+})
+
+check('an unverifiable legacy cache is not stamped with this run’s fingerprint', () => {
+  const d = D({ state: { completedUpTo: '500', found: 10 } })
+  assert.equal(d.action, 'resume')
+  assert.equal(d.stampQuery, false, 'stamping would make unverified bytes look verified after one run')
+  assert.match(d.warn ?? '', /predates filter fingerprinting/)
+  // And a verified one IS stamped.
+  assert.equal(D().stampQuery, true)
+})
+
+check('a re-swept range IS stamped — only a resumed one is not', () => {
+  // A re-sweep discards what was there and fetches the range under this run's
+  // filter, so its logs are this run's. Suppressing the stamp left the range
+  // permanently unfingerprinted and the guard blind to it forever after.
+  // Observed on settle-USAT-1: re-swept, then written as found:0 with no query.
+  const resweep = D({ logsPresent: false, logLines: 0, state: { completedUpTo: '500' } })
+  assert.equal(resweep.action, 'resweep')
+  assert.equal(resweep.stampQuery, true, 'fresh content under this run’s filter must be stamped')
+
+  const declined = D({ toBlock: 100n, state: { completedUpTo: '500' } })
+  assert.equal(declined.action, 'resweep')
+  assert.equal(declined.stampQuery, true, 'a declined resume also refetches, so it is this run’s content')
+
+  // The resume path is the one that must not stamp.
+  const resumed = D({ state: { completedUpTo: '500', found: 10 } })
+  assert.equal(resumed.action, 'resume')
+  assert.equal(resumed.stampQuery, false)
+})
+
+check('an unfiltered sweep has no filter to mismatch, so no warning', () => {
+  const d = D({ filtered: false, state: { completedUpTo: '500', found: 10 } })
+  assert.equal(d.action, 'resume')
+  assert.equal(d.warn, undefined)
+  assert.equal(d.stampQuery, true)
+})
+
+check('a corrupt completedUpTo re-sweeps instead of throwing', () => {
+  const d = D({ state: { completedUpTo: 'not-a-number', query: 'Q', found: 10 } })
+  assert.equal(d.action, 'resweep')
+})
+
+check('no state file at all is a plain re-sweep', () => {
+  const d = D({ state: null })
+  assert.equal(d.action, 'resweep')
+  assert.equal(d.truncateLogs, true, 'orphan logs with no state must not be appended to')
+})
+
+console.log('\nthe fingerprint reads the environment the way the fetcher does')
+
+/**
+ * `NO_PROXY ?? no_proxy` only skips null and undefined, so an exported-but-empty
+ * NO_PROXY="" won and no_proxy was never read — while envProxy() in
+ * net/fetch-evidence.ts skips empty strings. Two runs that routed the primary
+ * IPFS gateway differently therefore shared one fingerprint and one verdict
+ * cache. Introduced by the commit that made the fingerprint stable.
+ */
+await check('an empty NO_PROXY does not mask no_proxy in the digest', async () => {
+  const { firstSet } = await import('../src/config.js')
+  const saveUpper = process.env.NO_PROXY
+  const saveLower = process.env.no_proxy
+
+  process.env.NO_PROXY = ''
+  process.env.no_proxy = 'gateway.pinata.cloud'
+  assert.equal(
+    firstSet('NO_PROXY', 'no_proxy'), 'gateway.pinata.cloud',
+    'an empty upper-case value must not mask a set lower-case one — the fetcher honours the latter',
+  )
+
+  delete process.env.NO_PROXY
+  delete process.env.no_proxy
+  assert.equal(firstSet('NO_PROXY', 'no_proxy'), '', 'neither set is the empty string')
+
+  process.env.NO_PROXY = '  '
+  assert.equal(firstSet('NO_PROXY', 'no_proxy'), '', 'whitespace is not a value')
+
+  if (saveUpper === undefined) delete process.env.NO_PROXY
+  else process.env.NO_PROXY = saveUpper
+  if (saveLower === undefined) delete process.env.no_proxy
+  else process.env.no_proxy = saveLower
 })
 
 console.log(`\n${passed} passed (full suite)\n`)

@@ -201,6 +201,121 @@ export function classifyFailure(err: unknown): FailureKind {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 /**
+ * What to do with a cache on disk, decided without touching the disk.
+ *
+ * Pulled out of `getLogsChunked` so the decision can be tested exhaustively
+ * rather than asserted against the shape of the source. Four of this file's
+ * regressions lived in this decision and every one of them was a case nobody
+ * had enumerated: an over-full logs file treated as truncation, a legacy state
+ * with no logs read as a proven zero, a declined resume that left its stale
+ * logs in place, and a fingerprint stamped onto content it had just warned it
+ * could not verify.
+ */
+export type ResumeDecision =
+  | { action: 'refuse'; reason: string }
+  | { action: 'resweep'; warn?: string; truncateLogs: boolean; stampQuery: boolean }
+  | { action: 'resume'; at: bigint; truncateLogs: false; stampQuery: boolean; warn?: string }
+
+export function resumeDecision(input: {
+  state: CacheState | null
+  fromBlock: bigint
+  toBlock: bigint
+  queryTag: string
+  filtered: boolean
+  logsPresent: boolean
+  logLines: number
+  cacheKey: string
+}): ResumeDecision {
+  const { state, fromBlock, toBlock, queryTag, filtered, logsPresent, logLines, cacheKey } = input
+  if (!state) return { action: 'resweep', truncateLogs: logsPresent, stampQuery: true }
+
+  // A cache fetched for a different filter answers a question we are not asking.
+  if (state.query !== undefined && state.query !== queryTag) {
+    return {
+      action: 'refuse',
+      reason:
+        `Cache ${cacheKey} was written for a different filter (${state.query}, now ${queryTag}).\n` +
+        `Its logs answer a question this run is not asking. Delete data/${cacheKey}-*.jsonl\n` +
+        'and its .state file to re-sweep, or pin the run to the block range that produced it.',
+    }
+  }
+
+  /**
+   * A legacy state carries no fingerprint, so its logs were fetched for an
+   * argument set we cannot check. Proceeding is allowed, but the fingerprint is
+   * NOT stamped afterwards: one stamped run would make unverified bytes
+   * indistinguishable from verified ones and silence the warning forever.
+   */
+  /**
+   * Only a RESUME on unverified content goes unstamped.
+   *
+   * A re-sweep discards whatever was there and fetches the range again under
+   * this run's filter, so its logs are this run's and stamping them is simply
+   * true. Suppressing the stamp there left a re-swept range permanently
+   * unfingerprinted — it would never be caught by the filter guard again, and
+   * the warning it kept emitting was about content that was no longer legacy.
+   * Observed on settle-USAT-1, re-swept and then written as found:0 with no
+   * query.
+   */
+  const unverified = state.query === undefined && filtered
+  const warn = unverified
+    ? `${cacheKey} predates filter fingerprinting; its logs were fetched for an argument ` +
+      'set this run cannot verify. Its state will not be stamped, so this keeps firing ' +
+      'until the range is swept from scratch.'
+    : undefined
+
+  let resumeAt: bigint
+  try {
+    resumeAt = BigInt(state.completedUpTo) + 1n
+  } catch {
+    return { action: 'resweep', truncateLogs: logsPresent, stampQuery: true, warn }
+  }
+
+  if (!(resumeAt > fromBlock && resumeAt <= toBlock + 1n)) {
+    // Declined: a pin below completedUpTo, or a range this cache does not cover.
+    // Its logs must go, or the fetch loop appends this run's onto them.
+    return { action: 'resweep', truncateLogs: logsPresent, stampQuery: true, warn }
+  }
+
+  /**
+   * A missing logs file means "found nothing" ONLY when the state says so.
+   * A legacy state has no `found`, so nothing proves the sweep ever ran — and
+   * deleting the .jsonl was the documented way to force a re-sweep. Reading
+   * that as zero turns a deliberate invalidation into a silent false answer.
+   */
+  if (!logsPresent && state.found !== 0) {
+    return {
+      action: 'resweep',
+      truncateLogs: false,
+      stampQuery: true,
+      warn:
+        `${cacheKey} has a state file and no logs file, and its state does not record how ` +
+        'many logs it found. That is not proof of an empty sweep, so the range is being ' +
+        'swept again from scratch.',
+    }
+  }
+
+  /**
+   * Only a SHORT file is a finding. The append precedes the state write, so a
+   * process killed between them leaves MORE lines than `found` — the overlap
+   * `dedupeLogs` exists to absorb. Treating that as truncation made a handled
+   * case fatal, on files up to 280 MB.
+   */
+  if (state.found !== undefined && logLines < state.found) {
+    return {
+      action: 'refuse',
+      reason:
+        `Cache ${cacheKey} recorded ${state.found} logs and its file holds only ${logLines}.\n` +
+        'Bytes that were counted are missing, so resuming would publish a truncated\n' +
+        `sweep as a complete one. Delete data/${cacheKey}-*.jsonl and its .state file.`,
+    }
+  }
+
+  return { action: 'resume', at: resumeAt, truncateLogs: false, stampQuery: !unverified, warn }
+}
+
+
+/**
  * (txHash, logIndex) uniquely identifies a log. Duplicates can only enter
  * through the resume cache — a crash landing between the data append and the
  * state write makes the next run re-fetch a wave it already stored. Rare, but
@@ -322,55 +437,60 @@ export async function getLogsChunked<T extends AbiEvent>(params: {
     .slice(0, 16)
 
   let paths: ReturnType<typeof cachePaths> | null = null
+  /**
+   * Whether this run resumed on content whose filter it could not verify.
+   * Decided by resumeDecision(); carried here only to gate the state stamp.
+   */
+  let stampQuery = true
   if (cacheKey) {
     mkdirSync(CACHE_DIR, { recursive: true })
     paths = cachePaths(cacheKey)
+
+    let state: CacheState | null = null
     if (existsSync(paths.state)) {
       try {
-        const state: CacheState = JSON.parse(readFileSync(paths.state, 'utf8'))
-        const resumeAt = BigInt(state.completedUpTo) + 1n
-        if (state.query !== undefined && state.query !== queryTag) {
-          throw new Error(
-            `Cache ${cacheKey} was written for a different filter (${state.query}, now ${queryTag}).\n` +
-              `Its logs answer a question this run is not asking. Delete data/${cacheKey}-*.jsonl\n` +
-              'and its .state file to re-sweep, or pin the run to the block range that produced it.',
-          )
-        }
-        if (state.query === undefined && args) {
-          console.warn(
-            `\n  ! ${cacheKey} predates filter fingerprinting. Its logs were fetched for` +
-              '\n    some argument set this run cannot verify is the one it is asking for.' +
-              '\n    Re-sweep from scratch if the reviewer set may have changed.',
-          )
-        }
-        if (resumeAt > fromBlock && resumeAt <= toBlock + 1n) {
-          out = existsSync(paths.logs)
-            ? readFileSync(paths.logs, 'utf8')
-                .split('\n')
-                .filter(Boolean)
-                .map((line) => JSON.parse(line, reviver))
-            : []
-          if (state.found !== undefined && state.found !== out.length) {
-            throw new Error(
-              `Cache ${cacheKey} says it found ${state.found} logs and its file holds ${out.length}.\n` +
-                'Resuming would publish a truncated sweep as a complete one. Delete\n' +
-                `data/${cacheKey}-*.jsonl and its .state file to re-sweep.`,
-            )
-          }
-          cursor = resumeAt
-          process.stdout.write(`  resuming ${cacheKey} at block ${cursor} (${out.length} cached)\n`)
-        }
-      } catch (err) {
-        /**
-         * An unreadable cache is ignored and refetched. A cache that is
-         * readable and answers a *different filter* is not: continuing there
-         * means publishing another run's logs as this one's, which is the
-         * failure this fingerprint exists to prevent.
-         */
-        const m = (err as Error).message ?? ''
-        if (m.includes('was written for a different filter') || m.includes('and its file holds')) throw err
-        /* unreadable cache is simply ignored and refetched */
+        state = JSON.parse(readFileSync(paths.state, 'utf8')) as CacheState
+      } catch {
+        /* an unreadable state file is simply ignored and the range refetched */
       }
+    }
+
+    const logsPresent = existsSync(paths.logs)
+    let cached: any[] = []
+    if (logsPresent) {
+      try {
+        cached = readFileSync(paths.logs, 'utf8')
+          .split('\n')
+          .filter(Boolean)
+          .map((line) => JSON.parse(line, reviver))
+      } catch {
+        /* an unreadable logs file is treated as absent and refetched */
+      }
+    }
+
+    const decision = resumeDecision({
+      state,
+      fromBlock,
+      toBlock,
+      queryTag,
+      filtered: args !== undefined,
+      logsPresent,
+      logLines: cached.length,
+      cacheKey,
+    })
+
+    if (decision.action === 'refuse') throw new Error(decision.reason)
+    if (decision.warn) console.warn(`\n  ! ${decision.warn}`)
+    stampQuery = decision.stampQuery
+
+    if (decision.action === 'resume') {
+      out = cached
+      cursor = decision.at
+      process.stdout.write(`  resuming ${cacheKey} at block ${cursor} (${out.length} cached)\n`)
+    } else if (decision.truncateLogs) {
+      // Not resuming from this file, so it must not survive: the fetch loop
+      // appends, and a stale file would merge a previous sweep into this one.
+      writeFileSync(paths.logs, '')
     }
   }
 
@@ -451,7 +571,14 @@ export async function getLogsChunked<T extends AbiEvent>(params: {
             fresh.map((l) => JSON.stringify(l, replacer)).join('\n') + '\n',
           )
         }
-        writeFileSync(paths.state, JSON.stringify({ completedUpTo: waveEnd.toString(), query: queryTag, found: out.length }))
+        writeFileSync(
+          paths.state,
+          JSON.stringify({
+            completedUpTo: waveEnd.toString(),
+            ...(stampQuery ? { query: queryTag } : {}),
+            found: out.length,
+          }),
+        )
       }
 
       cursor = waveEnd + 1n
