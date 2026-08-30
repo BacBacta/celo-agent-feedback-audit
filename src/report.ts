@@ -121,6 +121,36 @@ export function renderMarkdown(r: AuditResult): string {
   const t = r.totalFeedback
   const burstEvents = r.bursts.reduce((s, b) => s + b.count, 0)
   const burstOneShot = r.bursts.reduce((s, b) => s + b.oneShotReviewers, 0)
+  /**
+   * Which clusters stand alone and which are stretches of continuous activity.
+   *
+   * "71% of feedback arrived in five-minute clusters" is exact and reads as
+   * pervasive bursting. Clusters are disjoint, so the count is honest — but a
+   * busy afternoon becomes a hundred consecutive clusters, each counted as
+   * one, and the reader cannot tell that from a hundred separate spikes. The
+   * distinction is the whole evidential weight of the section.
+   */
+  const burstRuns = (() => {
+    const b = [...r.bursts].sort((x, y) => x.startTs - y.startTs)
+    if (b.length === 0) {
+      return { isolated: 0, isolatedRecords: 0, longest: 0, longestRecords: 0 }
+    }
+    const runs: (typeof b)[] = []
+    let cur: typeof b = [b[0]!]
+    for (let i = 1; i < b.length; i++) {
+      if (b[i]!.startTs - b[i - 1]!.endTs <= 300) cur.push(b[i]!)
+      else { runs.push(cur); cur = [b[i]!] }
+    }
+    runs.push(cur)
+    const solo = runs.filter((run) => run.length === 1)
+    const size = (run: typeof b) => run.reduce((sum, c) => sum + c.count, 0)
+    return {
+      isolated: solo.length,
+      isolatedRecords: solo.reduce((sum, run) => sum + size(run), 0),
+      longest: Math.max(...runs.map((run) => run.length)),
+      longestRecords: Math.max(...runs.map(size)),
+    }
+  })()
 
   return `# Celo Agent Feedback Audit
 
@@ -351,7 +381,25 @@ them never reviewed anything again — a count of reviewers, not of the records
 above, and the two must not be read as one figure.
 
 A genuinely busy hour looks like this too. These are reported for inspection,
-not labelled fraudulent.
+not labelled fraudulent — and the shape below is why that caveat is not a
+formality.
+
+Clusters are disjoint by construction: a record belongs to at most one, so the
+figure above is not double-counted. But a *sustained* busy period is chopped
+into back-to-back clusters, and each one is counted separately, which makes
+continuous operation look like repeated bursting. Separating the two:
+
+| | Clusters | Records |
+|---|---|---|
+| Isolated — no other cluster within 5 minutes | ${num(burstRuns.isolated)} | ${num(burstRuns.isolatedRecords)} |
+| Inside a run of consecutive clusters | ${num(r.bursts.length - burstRuns.isolated)} | ${num(burstEvents - burstRuns.isolatedRecords)} |
+
+The longest unbroken run is **${num(burstRuns.longest)} consecutive clusters**
+holding ${num(burstRuns.longestRecords)} records — on the order of
+${(burstRuns.longest * 5 / 60).toFixed(0)} hours of continuous
+five-or-more-per-five-minutes activity, which reads as an operator running
+rather than as a spike. Only the isolated clusters are the shape the word
+"burst" describes.
 
 ## Method and limits
 
