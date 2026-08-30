@@ -12,6 +12,7 @@ import { reconcile, summarize } from '../src/analysis/reconcile.js'
 import { extractPaymentClaim } from '../src/analysis/payment.js'
 import { classifyFailure } from '../src/rpc.js'
 import { collectEvidence, renderMarkdown } from '../src/report.js'
+import { pool } from '../src/pool.js'
 import type { FeedbackRecord } from '../src/sources/feedback.js'
 import type { Settlement } from '../src/sources/settlements.js'
 
@@ -1416,6 +1417,57 @@ check('a missing figure stops the report instead of printing NaN', () => {
     /refusing to publish/,
     'a missing field must stop the render, not become "NaN" in a column of real numbers',
   )
+})
+
+/**
+ * The evidence pass must run at the mean latency, not the maximum.
+ *
+ * It was `Promise.all` over slices of 8 — dispatch eight, wait for all eight,
+ * dispatch the next eight. One host in this registry holds 1,570 of the 10,469
+ * declared pointers and never answers, so nearly every slice contained a
+ * record that burned the full 45-second budget while seven finished workers
+ * sat idle. The measured throughput was 10.7 records a minute, which is
+ * 8/45s to four figures: the arithmetic of the barrier, not of the network.
+ */
+await check('the pool runs at the mean latency, not the slowest item in a batch', async () => {
+  // Nine items: one takes 100 ticks, the rest take 1. Width 3.
+  const delays = [100, 1, 1, 1, 1, 1, 1, 1, 1]
+  let inFlight = 0
+  let peak = 0
+  const startedAt: number[] = []
+  let clock = 0
+  const tick = () => new Promise<void>((res) => setTimeout(res, 0))
+
+  const done: number[] = []
+  await pool(delays, 3, async (d, i) => {
+    inFlight++
+    peak = Math.max(peak, inFlight)
+    startedAt[i] = clock
+    for (let n = 0; n < d; n++) { clock++; await tick() }
+    done.push(i)
+    inFlight--
+  })
+
+  assert.equal(done.length, delays.length, 'every item must be processed exactly once')
+  assert.deepEqual([...done].sort((a, b) => a - b), delays.map((_, i) => i), 'no item claimed twice, none skipped')
+  assert.ok(peak <= 3, `at most 3 in flight, saw ${peak}`)
+  /**
+   * The load-bearing assertion. Under a barrier the last item cannot start
+   * until the 100-tick item's batch completes; under a pool the two fast
+   * workers chew through everything while it is still running.
+   */
+  assert.ok(
+    startedAt[8]! < 50,
+    `the last item started at tick ${startedAt[8]} — a pool must not wait for the slow item's batch`,
+  )
+})
+
+await check('an empty work list and a width wider than the list are both fine', async () => {
+  let calls = 0
+  await pool([], 8, async () => { calls++ })
+  assert.equal(calls, 0)
+  await pool([1, 2], 64, async () => { calls++ })
+  assert.equal(calls, 2, 'width is clamped to the number of items, and every item still runs')
 })
 
 console.log(`\n${passed} passed (full suite)\n`)

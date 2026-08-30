@@ -8,6 +8,7 @@ import { loadFeedback } from './sources/feedback.js'
 import { loadIdentity, loadSelfVerified } from './sources/identity.js'
 import { loadSettlementsFrom } from './sources/settlements.js'
 import { checkEvidence, type EvidenceVerdict } from './analysis/evidence.js'
+import { pool } from './pool.js'
 import { EvidenceArchive } from './archive.js'
 import { sample, sampleStride } from './sample.mjs'
 import { pinningStatus, closeDispatchers } from './net/fetch-evidence.js'
@@ -205,39 +206,51 @@ async function main() {
     console.log(`  retrieval rules ${rules} — no cached verdicts, every file will be fetched`)
   }
 
-  const CONCURRENCY = 8
+  /**
+   * A worker pool, not a barrier of fixed-size batches.
+   *
+   * This was `Promise.all` over slices of 8: dispatch eight, wait for all
+   * eight, dispatch the next eight. Throughput is then set by the *slowest*
+   * record in every group rather than by the average, and one host that
+   * exhausts EVIDENCE_BUDGET_MS holds seven finished workers idle for the rest
+   * of its 45 seconds.
+   *
+   * That is not a theoretical cost. One host in this registry accounts for
+   * 1,570 of the 10,469 declared pointers and never answers, so roughly every
+   * batch contained at least one budget-exhausting record and the measured
+   * rate sat at 8/45s — 10.7 records a minute, to four significant figures the
+   * arithmetic of the barrier rather than of the network. A full pass took
+   * over sixteen hours to do a few hours of work.
+   *
+   * Each worker now pulls the next record the moment it finishes its own, so
+   * the pool runs at the mean latency instead of the maximum. The number of
+   * requests in flight is unchanged — this buys throughput without asking any
+   * host for more than it was already being asked.
+   */
+  const CONCURRENCY = Math.max(1, Number(process.env.EVIDENCE_CONCURRENCY ?? 8))
   let failedChecks = 0
-  for (let i = 0; i < pending.length; i += CONCURRENCY) {
-    const batch = pending.slice(i, i + CONCURRENCY)
-    const settled = await Promise.all(
-      batch.map(async (f) => {
-        try {
-          const v = await checkEvidence(f, {
-            agentOwner: identity.owners.get(String(f.agentId))?.toLowerCase() ?? null,
-            archive,
-          })
-          return { rec: f, v }
-        } catch (err) {
-          /**
-           * One hostile file must not end the run. `Promise.all` rejects the
-           * whole batch on a single throw and the rejection reaches the top
-           * level, so a four-byte body used to abort an audit of ten thousand
-           * records — permanently, since the evidence phase has no resume.
-           * Failing this one record loudly is the only safe behaviour.
-           */
-          failedChecks++
-          console.error(`\n  ! evidence check threw for ${f.feedbackURI}: ${(err as Error).message}`)
-          return { rec: f, v: null }
-        }
-      }),
-    )
-    for (const { rec, v } of settled) {
-      if (!v) continue
-      verdictByRecord.set(rec, v)
-      cache.put(VerdictCache.key(rec), v)
+  await pool(pending, CONCURRENCY, async (f) => {
+    let v: EvidenceVerdict | null = null
+    try {
+      v = await checkEvidence(f, {
+        agentOwner: identity.owners.get(String(f.agentId))?.toLowerCase() ?? null,
+        archive,
+      })
+    } catch (err) {
+      /**
+       * One hostile file must not end the run. A throw that escapes here
+       * reaches the top level and kills a pass over ten thousand records —
+       * permanently, for everything not yet written to the verdict cache.
+       * Failing this one record loudly is the only safe behaviour.
+       */
+      failedChecks++
+      console.error(`\n  ! evidence check threw for ${f.feedbackURI}: ${(err as Error).message}`)
     }
+    if (!v) return
+    verdictByRecord.set(f, v)
+    cache.put(VerdictCache.key(f), v)
     process.stdout.write(`\r  evidence: ${verdictByRecord.size}/${toCheck.length}`)
-  }
+  })
   if (toCheck.length) process.stdout.write('\n')
   if (failedChecks) console.log(`  ${failedChecks} check(s) threw and were dropped — see errors above`)
   if (archive) {
