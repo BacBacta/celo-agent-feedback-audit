@@ -284,9 +284,26 @@ export function retrievalFingerprint(): string {
     `ar=${ARWEAVE_GATEWAYS.join('|')}`,
     // The payment half of every verdict comes from this endpoint.
     `rpc=${process.env.CELO_RPC_URL ?? '(default)'}`,
-    // Proxy settings change the path AND disable address pinning.
-    `proxy=${['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'NO_PROXY', 'no_proxy']
-      .map((k) => `${k}=${(process.env[k] ?? '').trim()}`).join(',')}`,
+    /**
+     * Whether traffic is proxied, and to which host — never the port.
+     *
+     * This hashed the full proxy URLs, and a sandboxed runner assigns a fresh
+     * port to its local proxy on every process: 35647, then 42287, then
+     * another. So the fingerprint changed on every run, the verdict cache was
+     * never once reused, and a full-history audit re-fetched all 10,469 files
+     * each time — five hours, every time, to reach verdicts already on disk.
+     *
+     * What changes a verdict is that the request is proxied at all: the path
+     * differs and address pinning is off. The port it happens to listen on
+     * changes nothing about the answer, so it is not an input.
+     */
+    `proxy=${['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy']
+      .map((k) => {
+        const v = (process.env[k] ?? '').trim()
+        if (!v) return `${k}=`
+        try { return `${k}=${new URL(v).hostname}` } catch { return `${k}=set` }
+      }).join(',')}`,
+    `noproxy=${(process.env.NO_PROXY ?? process.env.no_proxy ?? '').trim()}`,
   ].join(';')
   return createHash('sha256').update(parts).digest('hex').slice(0, 16)
 }

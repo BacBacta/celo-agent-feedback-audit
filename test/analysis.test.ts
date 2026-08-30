@@ -1218,6 +1218,27 @@ await check('changing what a verdict means starts a new cache, it does not inher
    * while the proxy decides both the network path and whether address pinning
    * happens at all. Neither was named in the digest.
    */
+  /**
+   * And it must be STABLE across runs, which is the other half of the job.
+   *
+   * It hashed the full proxy URLs, and a sandboxed runner assigns a fresh port
+   * to its local proxy every process — 35647, then 42287. So the fingerprint
+   * changed on every run, the verdict cache was never once reused, and a
+   * full-history audit re-fetched all 10,469 files each time to reach verdicts
+   * already sitting on disk. Five hours, every time.
+   */
+  const savedProxy = process.env.HTTPS_PROXY
+  process.env.HTTPS_PROXY = 'http://127.0.0.1:35647'
+  const portA = (await import('../src/config.js?port=a')).retrievalFingerprint()
+  process.env.HTTPS_PROXY = 'http://127.0.0.1:42287'
+  const portB = (await import('../src/config.js?port=b')).retrievalFingerprint()
+  assert.equal(portA, portB, 'the proxy PORT must not change the fingerprint')
+  process.env.HTTPS_PROXY = 'http://other-proxy.test:8080'
+  const hostC = (await import('../src/config.js?port=c')).retrievalFingerprint()
+  assert.notEqual(portA, hostC, 'a different proxy HOST is a different network path')
+  if (savedProxy === undefined) delete process.env.HTTPS_PROXY
+  else process.env.HTTPS_PROXY = savedProxy
+
   const savedRpc = process.env.CELO_RPC_URL
   process.env.CELO_RPC_URL = 'https://some-other-node.test'
   const other = (await import('../src/config.js?rpc=1')).retrievalFingerprint()
@@ -1255,7 +1276,7 @@ await check('changing what a verdict means starts a new cache, it does not inher
   for (const f of DECIDERS) h.update(FS.readFileSync(f))
   const digest = h.digest('hex').slice(0, 16)
   assert.equal(
-    digest, '6be98747c38bd343',
+    digest, '2ba92bf63c21f5b2',
     `retrieval semantics changed (digest ${digest}). Bump RETRIEVAL_RULES ` +
       `(currently "${RETRIEVAL_RULES}") and update this digest, or cached verdicts ` +
       'decided under the old rules will be republished as a fresh measurement.',
