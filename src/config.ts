@@ -65,7 +65,26 @@ export const LOG_CHUNK_SIZE = BigInt(envNumber('LOG_CHUNK_SIZE', 5_000))
 export const TRUNCATION_SUSPECT = envNumber('TRUNCATION_SUSPECT', 1_000)
 
 /** Indexed-argument batch size for targeted Transfer queries. */
-export const TOPIC_BATCH_SIZE = 100
+/**
+ * How many addresses go into one indexed-topic filter.
+ *
+ * It was 100, which made the settlement sweep 43 batches x 3 tokens = 129
+ * full-history passes, measured at 5.9 hours — enough that a guard skipped the
+ * sweep outright and the audit published a blank where its only chain-only
+ * figure belongs.
+ *
+ * Measured on 2026-08-30 against celo.blockscout.com: batches of 100, 250,
+ * 500, 1,000 and 2,000 all return exactly the same transfers as the
+ * unfiltered ground truth for the same window, at 0.2s and 0.4s respectively.
+ * The request cost barely moves; only the number of passes does. 4,252
+ * reviewers become 3 batches, and the sweep becomes 9 passes.
+ *
+ * A wider filter matches more logs per chunk, which moves the sweep closer to
+ * the endpoint's silent 1,000-log cap — so this number is only safe because
+ * getLogsChunked now treats a capped response as truncated and narrows. Do not
+ * raise it further without re-reading that guard.
+ */
+export const TOPIC_BATCH_SIZE = envNumber('TOPIC_BATCH_SIZE', 2_000)
 
 // ---------------------------------------------------------------------------
 // Event signatures
@@ -280,3 +299,15 @@ export function retrievalFingerprint(): string {
  * whole request's deadline, because a record can need several of them.
  */
 export const DNS_TIMEOUT_MS = envNumber('DNS_TIMEOUT_MS', 4_000)
+
+/**
+ * A full-history `eth_getLogs` pass per token per batch of reviewers. Measured
+ * at roughly 3 minutes each against the default endpoint, so this ceiling is
+ * about an hour of scanning.
+ */
+export const MAX_SETTLEMENT_PASSES = envNumber('MAX_SETTLEMENT_PASSES', 24)
+
+/** How many passes the settlement sweep would cost for this many reviewers. */
+export function settlementPasses(reviewers: number): number {
+  return Math.ceil(reviewers / TOPIC_BATCH_SIZE) * SETTLEMENT_TOKENS.length
+}

@@ -3,6 +3,7 @@ import type { Address } from 'viem'
 import { latestBlock, assertDeterministicLogs } from './rpc.js'
 import { AUDIT_VERSION, retrievalFingerprint } from './config.js'
 import { BLOCKS_PER_DAY, REGISTRY_DEPLOY_BLOCK, REPUTATION_REGISTRY, NEW_FEEDBACK_EVENT } from './config.js'
+import { SETTLEMENT_TOKENS, MAX_SETTLEMENT_PASSES, settlementPasses } from './config.js'
 import { loadFeedback } from './sources/feedback.js'
 import { loadIdentity, loadSelfVerified } from './sources/identity.js'
 import { loadSettlementsFrom } from './sources/settlements.js'
@@ -85,11 +86,21 @@ async function main() {
   let settlements: Awaited<ReturnType<typeof loadSettlementsFrom>> = []
   if (skipSettlements) {
     console.log('  settlements: skipped (SKIP_SETTLEMENTS=1)')
-  } else if (reviewers.length > 300) {
+  } else if (settlementPasses(reviewers.length) > MAX_SETTLEMENT_PASSES) {
+    /**
+     * The old guard fired above 300 reviewers and justified itself with a
+     * static formula — reviewers/100 x tokens x span/5000 — that reported
+     * 452,710 requests for this registry. That number ignored the chunking the
+     * RPC layer actually does; the measured cost was 5.9 hours, and after
+     * widening the topic filter it is about half an hour. A guard whose
+     * arithmetic is wrong by two orders of magnitude does not protect anyone,
+     * it just removes the one figure that depends on no off-chain file.
+     */
     console.log(
-      `  settlements: skipped — ${reviewers.length} reviewers would need roughly ` +
-        `${Math.round((reviewers.length / 100) * 3 * Number((toBlock - fromBlock) / 5000n))} requests.\n` +
-        '              Set SKIP_SETTLEMENTS=0 to force it, or narrow AUDIT_WINDOW.',
+      `  settlements: skipped — ${reviewers.length} reviewers over ` +
+        `${SETTLEMENT_TOKENS.length} tokens is ${settlementPasses(reviewers.length)} ` +
+        `full-history passes, above the ${MAX_SETTLEMENT_PASSES} allowed here.\n` +
+        '              Raise MAX_SETTLEMENT_PASSES, or narrow AUDIT_WINDOW.',
     )
   } else {
     settlements = await loadSettlementsFrom(reviewers, fromBlock, toBlock)
