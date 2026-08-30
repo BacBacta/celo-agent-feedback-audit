@@ -211,21 +211,31 @@ ${r.settlementsRan === false ? '> The settlement sweep did not run for this wind
 Independently of what a record declares, did this reviewer actually pay this
 agent's owner, in a stablecoin, before rating it?
 
-| | Records | Share |
+Every record falls into exactly one of these four:
+
+| Outcome | Records | Share |
 |---|---|---|
 | Paid the agent before reviewing it | **${num(r.reconciliation.backed)}** | **${pct(r.reconciliation.backed, t)}** |
 | Paid only *after* reviewing | ${num(r.reconciliation.paidAfterReview)} | ${pct(r.reconciliation.paidAfterReview, t)} |
 | No payment relationship found | ${num(t - r.reconciliation.backed - r.reconciliation.paidAfterReview - r.reconciliation.unresolvedAgent)} | ${pct(t - r.reconciliation.backed - r.reconciliation.paidAfterReview - r.reconciliation.unresolvedAgent, t)} |
 | Not askable — the agent has no owner in the registry | ${num(r.reconciliation.unresolvedAgent)} | ${pct(r.reconciliation.unresolvedAgent, t)} |
-| Reviewer is the agent's *current* registered owner | ${num(r.reconciliation.selfDealing)} | ${pct(r.reconciliation.selfDealing, t)} |
-| Paid **and** human-backed | ${num(r.reconciliation.backedAndHumanBacked)} | ${pct(r.reconciliation.backedAndHumanBacked, t)} |
 
-The last row measures ownership *as the registry holds it now*. An agent minted
-by its reviewer and transferred away before this run reads zero here, so treat
-it as a lower bound on self-dealing and not as its absence. The row above it is
-the count this audit could not ask the question of at all — separated out
-rather than folded into "no relationship found", which would have published
-four unasked questions as four negative answers.
+The last row is what this audit could not ask the question of at all, kept
+apart from "no relationship found" rather than folded into it: an unasked
+question published as a negative answer is the failure this whole report is
+about.
+
+These two overlap the four above and each other, so they are counted
+separately:
+
+| Also true of some of them | Records | Share |
+|---|---|---|
+| Reviewer is the agent's *current* registered owner | ${num(r.reconciliation.selfDealing)} | ${pct(r.reconciliation.selfDealing, t)} |
+| Paid **and** written by a Self ID holder | ${num(r.reconciliation.backedAndHumanBacked)} | ${pct(r.reconciliation.backedAndHumanBacked, t)} |
+
+Ownership is measured *as the registry holds it now*. An agent minted by its
+reviewer and transferred away before this run reads false, so read that row as
+a lower bound on self-dealing and not as its absence.
 
 ### …and how few relationships that rests on
 
@@ -241,7 +251,7 @@ ${r.reconciliation.backingTopPairs
   .join('\n')}
 
 ${r.reconciliation.backingTopPairs.length
-  ? `The largest single relationship carries **${(r.reconciliation.backingTopPairs[0]!.share * 100).toFixed(0)}%** of the backed records, ${r.reconciliation.backingTopPairs.length > 1 ? `and the top ${r.reconciliation.backingTopPairs.length} carry **${(r.reconciliation.backingTopPairs.reduce((a, p) => a + p.share, 0) * 100).toFixed(0)}%**. ` : 'and it is the only relationship large enough to list. '}Read the headline as "a few operators pay, and almost nobody else does" rather than as a market rate.`
+  ? `The largest single relationship carries **${(r.reconciliation.backingTopPairs[0]!.share * 100).toFixed(0)}%** of the backed records, ${r.reconciliation.backingTopPairs.length > 1 ? `and the ${r.reconciliation.backingTopPairs.length} listed above carry **${(r.reconciliation.backingTopPairs.reduce((a, p) => a + p.share, 0) * 100).toFixed(0)}%** between them. ` : 'and it is the only one listed above. '}Read the headline as "a few operators pay, and almost nobody else does" rather than as a market rate.`
   : ''}
 
 ### The same question, asked of the Self-ID figure
@@ -440,7 +450,7 @@ export function rung(
  * The documentary dimension, recorded independently of the payment one.
  *
  * A single verdict slot cannot carry both: the payment rungs outrank every
- * documentary rung, so for the 93 records that declare a payment the state of
+ * documentary rung, so for every record that declares a payment the state of
  * their file was measured and then thrown away. Reporting the two side by side
  * is what lets a consumer ask "settled AND intact" instead of guessing which
  * question the one verdict answered.
