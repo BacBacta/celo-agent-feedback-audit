@@ -546,7 +546,24 @@ async function main() {
   )
 }
 
-main().catch((e) => {
-  console.error('\nAudit failed:', e)
-  process.exit(1)
-})
+main()
+  .then(() => {
+    /**
+     * Say the work is done, then actually stop.
+     *
+     * The audit wrote every output and then hung: `closeDispatchers()` closes
+     * the evidence fetcher's connections, but Node's global agent keeps the
+     * RPC client's keep-alive sockets open — eight of them — and the event
+     * loop stays alive on handles nothing will ever use again. Measured: a run
+     * that finished at 11:19 was still resident at 13:36.
+     *
+     * Nothing is lost by this, because every writeFileSync above has already
+     * returned. But a run that never exits is a stuck job in CI, a cron entry
+     * that overlaps itself, and a container that is never reclaimed.
+     */
+    process.exit(0)
+  })
+  .catch((e) => {
+    console.error('\nAudit failed:', e)
+    process.exit(1)
+  })
