@@ -20,9 +20,22 @@ before rating it?** That question can be answered for every feedback record ever
 written, including the ones that declared nothing at all.
 
 A [June 2026 study][arxiv] measured the same registry on Ethereum, BSC and Base
-and found 59–91% of reviewers showing coordinated sybil behaviour, with
-manipulation costing fractions of a cent. It did not cover Celo. The measures
-here are deliberately the same ones, so the results are directly comparable.
+through 13 May 2026 and found 59.2–90.6% of reviewers showing coordinated sybil
+behaviour, with the median cost of fabricating or destroying a reputation at
+\$0.055 / \$0.0042 / \$0.0027 across the three chains. It did not cover Celo.
+
+**This audit is not a Celo replication of it, and this README used to imply it
+was.** That study's sybil figure comes from a shared-first-funder funding graph
+— tracing each reviewer to the address that first sent it native tokens and
+clustering reviewers under a common root. Nothing here implements that, and no
+sybil figure is published. Its Gini measures agents owned per wallet; the Gini
+here measures reviews written per reviewer. The two are close in magnitude and
+measure different things, which is worse than being far apart.
+
+What this audit does instead is the question that study identifies and leaves
+open — feedback "rarely grounded in verifiable interactions" — by reconstructing
+the payment relationship from chain state for every record, including the ones
+that declare nothing.
 
 ## What it reports
 

@@ -1581,4 +1581,49 @@ check('a completed sweep that found nothing is not re-swept from scratch', () =>
   }
 })
 
+/**
+ * The report must not claim comparability it does not have.
+ *
+ * It said its concentration figures were "the same measures as the arXiv
+ * ERC-8004 study… directly comparable to the published ones". They are not.
+ * That study's Gini (0.733 / 0.708 / 0.134) is over agents owned per wallet;
+ * ours is over reviews written per reviewer. Its top-decile is wallets holding
+ * agents; ours is the ten busiest reviewers. It reports no one-shot rate. Its
+ * headline sybil figure comes from a shared-first-funder funding graph that
+ * nothing in this repository implements.
+ *
+ * The magnitudes are close — 77.5% beside ">70%" — so the false comparison
+ * read as corroboration rather than as an obvious error. That is why this is a
+ * test and not a comment.
+ */
+check('no claim of comparability with a study whose measures differ', () => {
+  const claims = [
+    ['src/report.ts', FS.readFileSync('src/report.ts', 'utf8')],
+    ['README.md', FS.readFileSync('README.md', 'utf8')],
+    ['src/analysis/concentration.ts', FS.readFileSync('src/analysis/concentration.ts', 'utf8')],
+  ] as const
+
+  for (const [name, body] of claims) {
+    for (const phrase of ['directly comparable', 'the same measures', 'same measures as']) {
+      const at = body.toLowerCase().indexOf(phrase)
+      if (at === -1) continue
+      const around = body.slice(Math.max(0, at - 400), at + 400)
+      assert.ok(
+        /not|never|used to|no longer/i.test(around),
+        `${name} claims "${phrase}" near the study citation without a negation: ${around.slice(0, 200)}`,
+      )
+    }
+  }
+
+  const report = claims[0][1]
+  assert.match(
+    report, /publishes no Sybil figure|no sybil figure/i,
+    'the report must say plainly that it publishes no sybil figure, since the study it cites leads with one',
+  )
+  assert.match(
+    report, /agents owned per wallet/,
+    "the report must name what the study's Gini actually measures, not merely disclaim comparability",
+  )
+})
+
 console.log(`\n${passed} passed (full suite)\n`)

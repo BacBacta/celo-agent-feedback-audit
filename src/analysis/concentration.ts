@@ -1,10 +1,19 @@
 /**
  * Concentration and burst statistics.
  *
- * The arXiv study of ERC-8004 (2606.26028, June 2026) found 59-91% of reviewers
- * on Ethereum, BSC and Base showing coordinated sybil behaviour. It did not
- * cover Celo. These are the same measures, so the numbers are comparable to the
- * published ones.
+ * These are NOT the arXiv study's measures, and this file used to say they
+ * were. 2606.26028 reports a Gini over *agents owned per wallet* (0.733 /
+ * 0.708 / 0.134) and a top-decile of wallets by agents held; the functions
+ * below measure *reviews written per reviewer* and the ten single busiest
+ * reviewers. Different populations, different units, and close enough in
+ * magnitude that comparing them looks like agreement.
+ *
+ * That study's headline — 73.6% / 59.2% / 90.6% of reviewers exhibiting
+ * coordinated Sybil behaviour — comes from a shared-first-funder funding
+ * graph: trace each reviewer to the address that first sent it native tokens,
+ * cluster reviewers under a common root. Nothing here implements that. It is
+ * implementable against Celo and would be a real addition; until it exists,
+ * this module must not be described as producing a comparable number.
  */
 
 /**

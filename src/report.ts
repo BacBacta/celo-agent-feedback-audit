@@ -317,14 +317,30 @@ ${r.reconciliation.humanBackedTop
 
 ## Concentration
 
-Same measures as the arXiv ERC-8004 study (2606.26028, June 2026), which covered
-Ethereum, BSC and Base but not Celo — so these numbers are directly comparable
-to the published ones.
-
-- Gini over reviews per reviewer: **${r.concentration.gini.toFixed(3)}**
-- Top 10 reviewers wrote: **${(r.concentration.topTenShare * 100).toFixed(1)}%** of all feedback
+- Gini over **reviews per reviewer**: **${r.concentration.gini.toFixed(3)}**
+- The 10 most prolific reviewers wrote: **${(r.concentration.topTenShare * 100).toFixed(1)}%** of all feedback
 - Reviewers who reviewed exactly once: **${(r.concentration.oneShotReviewerRate * 100).toFixed(1)}%**
 - Most feedback from a single address: **${num(r.concentration.maxBySingleReviewer)}**
+
+> **These are not comparable to the arXiv ERC-8004 study's figures, and an
+> earlier version of this report said they were.** That study (2606.26028, 24
+> June 2026) covers Ethereum, BSC and Base through 13 May 2026, not Celo. Its
+> Gini coefficients — 0.733, 0.708, 0.134 — measure **agents owned per wallet**,
+> a concentration of registration. The figure above measures **reviews written
+> per reviewer**. Its "top 10%" is a decile of wallets holding agents; the
+> figure above is the ten single busiest reviewers. It reports no one-shot
+> reviewer rate at all.
+>
+> The proximity is what makes the claim dangerous rather than merely wrong:
+> ${(r.concentration.topTenShare * 100).toFixed(1)}% beside that study's ">70%"
+> reads as corroboration between two measurements that never met.
+>
+> Its headline — 73.6%, 59.2% and 90.6% of reviewers exhibiting coordinated
+> Sybil behaviour — comes from a shared-first-funder funding graph: each reviewer
+> is traced to the address that first sent it native tokens, and reviewers under
+> a common root are one cluster. **This audit does not implement that analysis
+> and publishes no Sybil figure.** Nothing below should be read as a Celo
+> counterpart to it.
 
 ## Temporal clustering
 
