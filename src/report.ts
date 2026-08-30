@@ -141,18 +141,47 @@ disappears stays checkable against the bytes it judged, whichever run fetched th
 
 ## Headline
 
-| Measure | Value |
+What the registry says about itself, narrowing:
+
+| Measure | Records | Share |
+|---|---|---|
+| Feedback records written | **${num(t)}** | 100% |
+| ⤷ declaring an evidence file | **${num(r.evidence.declaresURI)}** | **${pct(r.evidence.declaresURI, t)}** |
+| ⤷ ⤷ whose file this audit read and matched to its attested hash | ${num(r.evidence.hashMatched)} | ${pct(r.evidence.hashMatched, t)} |
+| ⤷ ⤷ ⤷ claiming a specific payment transaction | ${num(r.evidence.claimsPayment)} | ${pct(r.evidence.claimsPayment, t)} |
+| ⤷ ⤷ ⤷ ⤷ whose claimed transaction exists on chain | ${num(r.evidence.txExists)} | ${pct(r.evidence.txExists, t)} |
+| ⤷ ⤷ ⤷ ⤷ ⤷ whose payment actually verifies | **${num(r.evidence.paymentVerified)}** | **${pct(r.evidence.paymentVerified, t)}** |
+| ⤷ ⤷ ⤷ ⤷ ⤷ ⤷ and is *attributable* to this reviewer and agent | **${num(r.evidence.paymentAttributed)}** | **${pct(r.evidence.paymentAttributed, t)}** |
+| ⤷ carrying only an attested hash, no file | ${num(r.evidence.hashWithoutURI)} | ${pct(r.evidence.hashWithoutURI, t)} |
+
+The **read-and-matched** row is where most of the fall happens, and it is about
+retrieval rather than about what reviewers declare: of
+${num(r.evidence.declaresURI)} pointers, ${num(r.evidence.hashMatched)} led to a
+document this audit could read and bind to its attested hash. The Evidence chain
+section below decomposes that drop into its causes. Note that the Share column
+stays relative to all ${num(t)} feedback records the whole way down — it is not
+a share of the row above, so a small percentage there is not a small survival
+rate at that step.
+
+What the chain says, asked independently of anything a record declares. These
+are not narrowings of the rows above and do not belong in that column:
+
+| Measure | Records | Share |
+|---|---|---|
+| Reviewer demonstrably paid the agent | **${num(r.reconciliation.backed)}** | **${pct(r.reconciliation.backed, t)}** |
+| Written by a Self Agent ID holder | **${num(r.reconciliation.humanBacked)}** | **${pct(r.reconciliation.humanBacked, t)}** |
+
+**${num(r.evidence.paymentAttributed)} against ${num(r.reconciliation.backed)}** is
+the finding. Not that payment is absent — one review in ${(t / Math.max(1, r.reconciliation.backed)).toFixed(0)} is
+backed by a stablecoin transfer this audit reconstructed from chain state — but
+that essentially none of it is *declared*, and of the handful that is declared,
+none survives attribution. The evidence slot the standard provides is not being
+used by the people who are, in fact, paying. Both figures come with a
+concentration caveat below; read them together with it.
+
+| Also measured | Count |
 |---|---|
-| Feedback records written | **${num(t)}** |
-| …declaring an evidence file | **${num(r.evidence.declaresURI)} (${pct(r.evidence.declaresURI, t)})** |
-| …carrying only an attested hash, no file | ${num(r.evidence.hashWithoutURI)} (${pct(r.evidence.hashWithoutURI, t)}) |
-| …claiming a specific payment transaction | ${num(r.evidence.claimsPayment)} (${pct(r.evidence.claimsPayment, t)}) |
-| …whose claimed transaction exists on chain | ${num(r.evidence.txExists)} (${pct(r.evidence.txExists, t)}) |
-| …whose payment actually verifies | **${num(r.evidence.paymentVerified)} (${pct(r.evidence.paymentVerified, t)})** |
-| …whose payment is also *attributable* to this reviewer and agent | **${num(r.evidence.paymentAttributed)} (${pct(r.evidence.paymentAttributed, t)})** |
-| …where the reviewer demonstrably paid the agent | **${num(r.reconciliation.backed)} (${pct(r.reconciliation.backed, t)})** |
-| …written by a Self Agent ID holder | **${num(r.reconciliation.humanBacked)} (${pct(r.reconciliation.humanBacked, t)})** |
-| Stablecoin transfers sent by these reviewers, to anyone | ${num(r.settlementsSeen)} |
+| Stablecoin transfers sent by these reviewers, to anyone (transfers, not records) | ${num(r.settlementsSeen)} |
 
 ## What the registry contains
 
