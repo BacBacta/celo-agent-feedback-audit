@@ -44,9 +44,25 @@ export const BLOCKS_PER_DAY = 86_400n
 /**
  * eth_getLogs range cap. Public RPCs reject wide ranges — forno.celo.org caps
  * at 5,000 blocks (~83 minutes), which is the tightest limit observed, so it is
- * the default. Endpoints that allow more are discovered at runtime.
+ * the default.
+ *
+ * Chunks are only ever NARROWED at runtime, never widened: `ceiling` in
+ * getLogsChunked starts here and a range rejection or a capped response lowers
+ * it. An earlier comment claimed the opposite — that wider ranges were
+ * discovered — which was both false and, given the cap below, the dangerous
+ * direction to be wrong in.
  */
-export const LOG_CHUNK_SIZE = 5_000n
+export const LOG_CHUNK_SIZE = BigInt(envNumber('LOG_CHUNK_SIZE', 5_000))
+
+/**
+ * A response this large is treated as truncated rather than complete.
+ *
+ * celo.blockscout.com/api/eth-rpc returns at most 1,000 logs and reports
+ * nothing: 100,000 and 400,000 block ranges both come back with exactly 1,000.
+ * The densest 5,000-block window this audit scans holds 471 NewFeedback
+ * events, so there is a factor of two of headroom and no more.
+ */
+export const TRUNCATION_SUSPECT = envNumber('TRUNCATION_SUSPECT', 1_000)
 
 /** Indexed-argument batch size for targeted Transfer queries. */
 export const TOPIC_BATCH_SIZE = 100

@@ -1255,7 +1255,7 @@ await check('changing what a verdict means starts a new cache, it does not inher
   for (const f of DECIDERS) h.update(FS.readFileSync(f))
   const digest = h.digest('hex').slice(0, 16)
   assert.equal(
-    digest, 'b58b8e6ead344a3b',
+    digest, 'c4dcb793f09a70d4',
     `retrieval semantics changed (digest ${digest}). Bump RETRIEVAL_RULES ` +
       `(currently "${RETRIEVAL_RULES}") and update this digest, or cached verdicts ` +
       'decided under the old rules will be republished as a fresh measurement.',

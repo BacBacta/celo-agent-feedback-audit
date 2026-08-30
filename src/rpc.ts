@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { mkdirSync, existsSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs'
 import { createPublicClient, http, type AbiEvent, type Address } from 'viem'
 import { celo } from 'viem/chains'
-import { LOG_CHUNK_SIZE } from './config.js'
+import { LOG_CHUNK_SIZE, TRUNCATION_SUSPECT } from './config.js'
 
 /**
  * A database-backed indexer by default, not the public gateway.
@@ -301,7 +301,7 @@ export async function getLogsChunked<T extends AbiEvent>(params: {
     }
   }
 
-  // Permanent: only a range rejection lowers this.
+  // Permanent: only a range rejection or a capped response lowers this.
   let ceiling = LOG_CHUNK_SIZE
   // Current attempt: may dip below the ceiling for a dense stretch, then recover.
   let span = LOG_CHUNK_SIZE
@@ -328,6 +328,44 @@ export async function getLogsChunked<T extends AbiEvent>(params: {
           } as any),
         ),
       )
+
+      /**
+       * A response at the cap is a truncated response, not a full one.
+       *
+       * Measured on 2026-08-30: celo.blockscout.com/api/eth-rpc returns at most
+       * 1,000 logs and says nothing about it — 100,000 blocks and 400,000
+       * blocks both come back with exactly 1,000. forno and Ankr reject a
+       * range they cannot serve, which is an honest answer; this endpoint
+       * gives a plausible one instead.
+       *
+       * The audit is under that today: the densest 5,000-block window of
+       * NewFeedback holds 471 events. But that is a factor of two, and the
+       * registry is growing. A silent truncation here does not produce an
+       * error or a gap — it produces a smaller census, a different Merkle
+       * root, and a coverage claim that counts records nobody can reproduce.
+       *
+       * So a wave that comes back at the cap is not believed: the span is
+       * halved and the wave re-asked, until either the responses drop below
+       * the cap or the span reaches one block, which fails loudly.
+       */
+      const suspect = waves.findIndex((w) => w.length >= TRUNCATION_SUSPECT)
+      if (suspect !== -1) {
+        if (span <= 1n) {
+          throw new Error(
+            `The endpoint returned ${waves[suspect]!.length} logs for a single block ` +
+            `(${ranges[suspect]!.from}). That is at or above the response cap, so the ` +
+            'answer is truncated and cannot be narrowed further. Use an endpoint that ' +
+            'rejects oversized ranges instead of silently capping them.',
+          )
+        }
+        ceiling = span / 2n
+        span = ceiling
+        console.log(
+          `\n  response at the cap (${waves[suspect]!.length} logs) — narrowing to ` +
+          `${span}-block chunks and re-asking. A capped response is a truncated one.`,
+        )
+        continue
+      }
 
       const fresh = waves.flat()
       out.push(...fresh)
