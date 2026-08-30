@@ -29,6 +29,18 @@ export interface Settlement {
  * indexed `from` is one of those reviewers. eth_getLogs accepts an array of
  * values per indexed topic, so this costs a few hundred requests instead of
  * scanning the whole chain — and it is exact, not sampled.
+ *
+ * DO NOT invert it the other way. Filtering on `to` — the 565 distinct agent
+ * owners rather than the 4,252 reviewers — is seven times cheaper and looks
+ * strictly better, and it would also catch a platform paying on the reviewer's
+ * behalf, which this design currently reports as unattributed. It is a trap.
+ * Measured on 2026-08-30: the default endpoint, celo.blockscout.com/api/eth-rpc,
+ * honours a filter on the FIRST indexed argument and silently ignores the
+ * second. Asked for Transfers with `to` set to an address that demonstrably
+ * appears in the window, it returns an empty array — no error — which reads
+ * exactly like "this owner received nothing". forno and Ankr answer correctly.
+ * `probeTopicFiltering` in rpc.ts exists to stop that idea with a failing
+ * check rather than a published zero.
  */
 export async function loadSettlementsFrom(
   payers: Address[],

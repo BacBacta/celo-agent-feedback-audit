@@ -1142,6 +1142,39 @@ check('every shape proofOfPayment arrives in is read, and an unreadable one says
   }
 })
 
+console.log('\nfiltering on a topic the endpoint ignores')
+
+await check('nothing in this audit filters on a second indexed topic', async () => {
+  const FS = await import('node:fs')
+  /**
+   * The default endpoint honours a filter on the FIRST indexed argument and
+   * silently ignores the second: asked for Transfer logs with `to` set to an
+   * address that demonstrably appears in the window, celo.blockscout.com
+   * returns an empty array, no error. forno and Ankr answer correctly.
+   *
+   * Nothing filters on `to` today. The settlement sweep is one plausible
+   * optimisation away from it — the 565 agent owners are seven times cheaper
+   * to query than the 4,252 reviewers — and that optimisation would publish a
+   * clean, fabricated zero. This test is the tripwire: it fails the moment a
+   * `to:` filter appears in the sources, and points at probeTopicFiltering.
+   */
+  const walk = (dir: string): string[] =>
+    FS.readdirSync(dir, { withFileTypes: true }).flatMap((e: any) =>
+      e.isDirectory() ? walk(`${dir}/${e.name}`) : [`${dir}/${e.name}`])
+
+  for (const f of walk('src').filter((f) => f.endsWith('.ts'))) {
+    const src = FS.readFileSync(f, 'utf8')
+    // `args: { to: … }` on a getLogs call. `from:` is fine — it is honoured.
+    const hit = /args:\s*\{[^}]*\bto\s*:/.exec(src)
+    assert.equal(
+      hit, null,
+      `${f} filters eth_getLogs on \`to\`, the second indexed topic. The default ` +
+      'endpoint ignores it and returns an empty array with no error. Probe the ' +
+      'endpoint with probeTopicFiltering() before relying on that filter.',
+    )
+  }
+})
+
 console.log('\nthe verdict cache remembers which rules decided it')
 
 const FS = await import('node:fs')
@@ -1222,7 +1255,7 @@ await check('changing what a verdict means starts a new cache, it does not inher
   for (const f of DECIDERS) h.update(FS.readFileSync(f))
   const digest = h.digest('hex').slice(0, 16)
   assert.equal(
-    digest, '5dd85b97909c182a',
+    digest, 'b58b8e6ead344a3b',
     `retrieval semantics changed (digest ${digest}). Bump RETRIEVAL_RULES ` +
       `(currently "${RETRIEVAL_RULES}") and update this digest, or cached verdicts ` +
       'decided under the old rules will be republished as a fresh measurement.',

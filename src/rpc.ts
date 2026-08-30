@@ -456,3 +456,57 @@ export async function blockTimestamps(blocks: bigint[]): Promise<Map<bigint, num
   }
   return tsCache
 }
+
+/**
+ * Does this endpoint actually apply the topic filters it is given?
+ *
+ * Measured on 2026-08-30: celo.blockscout.com/api/eth-rpc honours a filter on
+ * the FIRST indexed argument and silently ignores the second. Asked for
+ * Transfer logs with `to` set to an address that demonstrably appears in the
+ * window, it returns zero — no error, no warning, an empty array that reads
+ * exactly like "this address received nothing". forno and Ankr both answer
+ * correctly on the same query in the same window.
+ *
+ * Nothing in this audit filters on `to` today, so nothing is wrong in what has
+ * been published. But the settlement sweep is one obvious optimisation away
+ * from it — filtering on the 565 agent owners instead of the 4,252 reviewers
+ * is seven times cheaper, and on this endpoint it would have produced a clean,
+ * plausible, entirely fabricated zero. This function exists so that the next
+ * person to have that idea is stopped by a failing check rather than by
+ * publishing it.
+ *
+ * @returns the indexed positions this endpoint honours, 1-based.
+ */
+export async function probeTopicFiltering(params: {
+  address: Address
+  event: AbiEvent
+  fromBlock: bigint
+  toBlock: bigint
+  /** Names of the indexed arguments to probe, in order. */
+  indexed: string[]
+}): Promise<{ honoured: string[]; ignored: string[] }> {
+  const ask = (args?: Record<string, unknown>) =>
+    throughRateLimit('topic-probe', () =>
+      client.getLogs({
+        address: params.address,
+        event: params.event,
+        fromBlock: params.fromBlock,
+        toBlock: params.toBlock,
+        ...(args ? { args } : {}),
+      } as any),
+    )
+
+  const all = await ask()
+  if (!all.length) return { honoured: [], ignored: [] }
+  const sample = (all[0] as any).args as Record<string, unknown>
+
+  const honoured: string[] = []
+  const ignored: string[] = []
+  for (const name of params.indexed) {
+    const value = sample[name]
+    if (value === undefined) continue
+    const got = await ask({ [name]: value })
+    ;(got.length > 0 ? honoured : ignored).push(name)
+  }
+  return { honoured, ignored }
+}
