@@ -28,7 +28,16 @@ export interface AuditResult {
      */
     parsed: number
     hashMatched: number
+    /** Inside the chain: a hash-matched document that carries a payment claim. */
     claimsPayment: number
+    /**
+     * Every payment claim, whatever the state of the file carrying it.
+     *
+     * The two are equal in this run and are not equal by construction. If they
+     * ever diverge, the difference is claims made in documents that do not
+     * match their attested hash — which is a finding, not a rounding error.
+     */
+    claimsPaymentAnyHash: number
     txExists: number
     paymentVerified: number
     paymentAttributed: number
@@ -82,8 +91,27 @@ export interface AuditResult {
   selfVerifiedReviewers: number
 }
 
-const pct = (n: number, d: number) => (d === 0 ? '0.0%' : `${((n / d) * 100).toFixed(1)}%`)
-const num = (n: number) => n.toLocaleString('en-US')
+/**
+ * A formatter that refuses rather than printing `NaN`.
+ *
+ * A field the report reads and the result object does not carry rendered as
+ * the string "NaN" in a numeric column — indistinguishable, to a reader, from
+ * a measured zero or a rounding artifact, and published with the same
+ * confidence as every real figure beside it. A report whose whole subject is
+ * numbers that overstate what they measured cannot print one that measures
+ * nothing at all.
+ */
+function requireFinite(n: number, where: string): number {
+  if (typeof n !== 'number' || !Number.isFinite(n)) {
+    throw new Error(`report: ${where} is ${String(n)}, not a number — refusing to publish it`)
+  }
+  return n
+}
+const pct = (n: number, d: number) =>
+  requireFinite(d, 'a denominator') === 0
+    ? '0.0%'
+    : `${((requireFinite(n, 'a numerator') / d) * 100).toFixed(1)}%`
+const num = (n: number) => requireFinite(n, 'a published figure').toLocaleString('en-US')
 
 export function renderMarkdown(r: AuditResult): string {
   const t = r.totalFeedback
@@ -139,19 +167,24 @@ ${
   r.evidence.sampled < r.evidence.declaresURI
     ? `> **Sampled, not complete.** ${num(r.evidence.sampled)} of ${num(r.evidence.declaresURI)} records that declare a file were opened — every ${r.evidence.sampleStride}th, evenly spread across the period rather than taken from one end. Every row below from "bytes came back from the pointer" downwards is a count **within that sample**, while the percentages are of all feedback: read them as lower bounds. The ${num(r.evidence.declaresURI - r.evidence.sampled)} records that were not opened are exported with the rung \`NotChecked\` and nothing is attested for them.\n\n`
     : ''
-}| Step | Records | Share of all feedback |
+}Each row indented under another is a **subset** of it. Rows at the left margin
+start a new question and are not subsets of the row above — a chain of
+indistinguishable rows is how a table implies a narrowing that never happened.
+
+| Step | Records | Share of all feedback |
 |---|---|---|
 | Declares a \`feedbackURI\` | ${num(r.evidence.declaresURI)} | ${pct(r.evidence.declaresURI, t)} |
+| ⤷ bytes came back from the pointer | ${num(r.evidence.fetched)} | ${pct(r.evidence.fetched, t)} |
+| ⤷ …and those bytes parsed as a JSON document | ${num(r.evidence.parsed)} | ${pct(r.evidence.parsed, t)} |
+| ⤷ …and the document matches the attested hash | ${num(r.evidence.hashMatched)} | ${pct(r.evidence.hashMatched, t)} |
+| ⤷ …and the document contains a payment claim | ${num(r.evidence.claimsPayment)} | ${pct(r.evidence.claimsPayment, t)} |
+| ⤷ …and the claimed transaction exists on chain | ${num(r.evidence.txExists)} | ${pct(r.evidence.txExists, t)} |
+| ⤷ …and it succeeded and moved value — **verified** | **${num(r.evidence.paymentVerified)}** | **${pct(r.evidence.paymentVerified, t)}** |
+| ⤷ …and its parties are this reviewer and this agent — **attributed** | **${num(r.evidence.paymentAttributed)}** | **${pct(r.evidence.paymentAttributed, t)}** |
+| ⤷ …or its parties contradict the claim — **mismatch** | ${num(r.evidence.partyMismatch)} | ${pct(r.evidence.partyMismatch, t)} |
 | Declares a non-zero \`feedbackHash\` | ${num(r.evidence.declaresHash)} | ${pct(r.evidence.declaresHash, t)} |
-| Hash attested but no file published | ${num(r.evidence.hashWithoutURI)} | ${pct(r.evidence.hashWithoutURI, t)} |
-| …bytes came back from the pointer | ${num(r.evidence.fetched)} | ${pct(r.evidence.fetched, t)} |
-| …and those bytes parsed as a JSON document | ${num(r.evidence.parsed)} | ${pct(r.evidence.parsed, t)} |
-| …and the document matches the attested hash | ${num(r.evidence.hashMatched)} | ${pct(r.evidence.hashMatched, t)} |
-| Contains a payment claim | ${num(r.evidence.claimsPayment)} | ${pct(r.evidence.claimsPayment, t)} |
-| Claimed transaction exists on chain | ${num(r.evidence.txExists)} | ${pct(r.evidence.txExists, t)} |
-| Payment verified — exists, succeeded, moved value | **${num(r.evidence.paymentVerified)}** | **${pct(r.evidence.paymentVerified, t)}** |
-| Payment attributed — …and paid by this reviewer to this agent | **${num(r.evidence.paymentAttributed)}** | **${pct(r.evidence.paymentAttributed, t)}** |
-| Payment cited but its parties contradict the claim | ${num(r.evidence.partyMismatch)} | ${pct(r.evidence.partyMismatch, t)} |
+| ⤷ …while publishing no file at all | ${num(r.evidence.hashWithoutURI)} | ${pct(r.evidence.hashWithoutURI, t)} |
+| Payment claims in documents whose hash does *not* match | ${num(r.evidence.claimsPaymentAnyHash - r.evidence.claimsPayment)} | ${pct(r.evidence.claimsPaymentAnyHash - r.evidence.claimsPayment, t)} |
 | Payment declared on a chain this audit does not query | ${num(r.evidence.foreignChain)} | ${pct(r.evidence.foreignChain, t)} |
 
 > **What \`EvidenceUnreachable\` contains.** The rung is not a synonym for 404.
@@ -182,14 +215,22 @@ agent's owner, in a stablecoin, before rating it?
 |---|---|---|
 | Paid the agent before reviewing it | **${num(r.reconciliation.backed)}** | **${pct(r.reconciliation.backed, t)}** |
 | Paid only *after* reviewing | ${num(r.reconciliation.paidAfterReview)} | ${pct(r.reconciliation.paidAfterReview, t)} |
-| No payment relationship found | ${num(t - r.reconciliation.backed - r.reconciliation.paidAfterReview)} | ${pct(t - r.reconciliation.backed - r.reconciliation.paidAfterReview, t)} |
-| Reviewer owns the agent it reviewed | ${num(r.reconciliation.selfDealing)} | ${pct(r.reconciliation.selfDealing, t)} |
+| No payment relationship found | ${num(t - r.reconciliation.backed - r.reconciliation.paidAfterReview - r.reconciliation.unresolvedAgent)} | ${pct(t - r.reconciliation.backed - r.reconciliation.paidAfterReview - r.reconciliation.unresolvedAgent, t)} |
+| Not askable — the agent has no owner in the registry | ${num(r.reconciliation.unresolvedAgent)} | ${pct(r.reconciliation.unresolvedAgent, t)} |
+| Reviewer is the agent's *current* registered owner | ${num(r.reconciliation.selfDealing)} | ${pct(r.reconciliation.selfDealing, t)} |
 | Paid **and** human-backed | ${num(r.reconciliation.backedAndHumanBacked)} | ${pct(r.reconciliation.backedAndHumanBacked, t)} |
+
+The last row measures ownership *as the registry holds it now*. An agent minted
+by its reviewer and transferred away before this run reads zero here, so treat
+it as a lower bound on self-dealing and not as its absence. The row above it is
+the count this audit could not ask the question of at all — separated out
+rather than folded into "no relationship found", which would have published
+four unasked questions as four negative answers.
 
 ### …and how few relationships that rests on
 
-One review in five being backed by a real payment is exact, and on its own it
-suggests a broad market. It is not one. The ${num(r.reconciliation.backed)}
+${pct(r.reconciliation.backed, t)} of reviews being backed by a real payment is
+exact, and on its own it suggests a broad market. It is not one. The ${num(r.reconciliation.backed)}
 backed records come from **${num(r.reconciliation.backingPairs)} distinct
 reviewer→owner relationships**, and they are distributed like this:
 
@@ -200,7 +241,7 @@ ${r.reconciliation.backingTopPairs
   .join('\n')}
 
 ${r.reconciliation.backingTopPairs.length
-  ? `The largest single relationship carries **${(r.reconciliation.backingTopPairs[0]!.share * 100).toFixed(0)}%** of the backed records, and the top five carry **${(r.reconciliation.backingTopPairs.reduce((a, p) => a + p.share, 0) * 100).toFixed(0)}%**. Read the headline as "a few operators pay, and almost nobody else does" rather than as a market rate.`
+  ? `The largest single relationship carries **${(r.reconciliation.backingTopPairs[0]!.share * 100).toFixed(0)}%** of the backed records, ${r.reconciliation.backingTopPairs.length > 1 ? `and the top ${r.reconciliation.backingTopPairs.length} carry **${(r.reconciliation.backingTopPairs.reduce((a, p) => a + p.share, 0) * 100).toFixed(0)}%**. ` : 'and it is the only relationship large enough to list. '}Read the headline as "a few operators pay, and almost nobody else does" rather than as a market rate.`
   : ''}
 
 ### The same question, asked of the Self-ID figure
@@ -208,8 +249,9 @@ ${r.reconciliation.backingTopPairs.length
 ${num(r.reconciliation.humanBacked)} records were written by an address holding a
 Self Agent ID. That is **${num(r.reconciliation.humanBackedReviewers)} distinct
 addresses**${r.reconciliation.humanBackedTop.length ? `, of which the largest wrote ${num(r.reconciliation.humanBackedTop[0]!.records)} — ${(r.reconciliation.humanBackedTop[0]!.share * 100).toFixed(0)}% of the figure` : ''}.
-Read it as "a handful of verified operators are prolific", not as "one review in
-eight came from a verified human", which is what the percentage alone suggests.
+Read it as "a handful of verified operators are prolific", not as
+"${pct(r.reconciliation.humanBacked, t)} of reviews came from a verified human",
+which is what the percentage alone suggests.
 
 | Self-ID reviewer | Records | Share of the figure |
 |---|---|---|
@@ -230,7 +272,7 @@ to the published ones.
 
 ## Temporal clustering
 
-${r.bursts.length} clusters of ≥5 reviews within a 5-minute window. Those
+${num(r.bursts.length)} clusters of ≥5 reviews within a 5-minute window. Those
 clusters hold **${num(burstEvents)} records (${pct(burstEvents, t)} of all
 feedback)**. Separately, ${num(burstOneShot)} of the addresses writing inside
 them never reviewed anything again — a count of reviewers, not of the records
@@ -300,13 +342,30 @@ export function collectEvidence(verdicts: EvidenceVerdict[], sampled: number) {
     hashWithoutURI: 0,
     sampleStride: 1,
     withPointer: verdicts.filter((v) => v.hasPointer).length,
+    /**
+     * The ladder is nested by construction, not by luck.
+     *
+     * Each of these was an independent filter, and the table presented them as
+     * a chain in which each row narrows the one above. That held in the data by
+     * coincidence — a document carrying a payment claim under a hash that does
+     * not match would have appeared *below* a row it is not inside, and the
+     * table would have gone on reading as a chain. Nesting the predicates makes
+     * the shape the table promises a property of the code.
+     */
     fetched: verdicts.filter((v) => v.fetched).length,
     parsed: verdicts.filter((v) => v.fetched && v.jsonValid).length,
-    hashMatched: verdicts.filter((v) => v.hashMatches).length,
-    claimsPayment: verdicts.filter((v) => v.claimsPayment).length,
-    txExists: verdicts.filter((v) => v.txExists).length,
-    paymentVerified: verdicts.filter((v) => v.paymentVerified).length,
-    paymentAttributed: verdicts.filter((v) => v.paymentAttributed).length,
+    hashMatched: verdicts.filter((v) => v.fetched && v.jsonValid && v.hashMatches).length,
+    claimsPayment: verdicts.filter((v) => v.fetched && v.jsonValid && v.hashMatches && v.claimsPayment).length,
+    claimsPaymentAnyHash: verdicts.filter((v) => v.claimsPayment).length,
+    txExists: verdicts.filter((v) => v.fetched && v.jsonValid && v.hashMatches && v.claimsPayment && v.txExists).length,
+    paymentVerified: verdicts.filter(
+      (v) => v.fetched && v.jsonValid && v.hashMatches && v.claimsPayment && v.txExists && v.paymentVerified,
+    ).length,
+    paymentAttributed: verdicts.filter(
+      (v) =>
+        v.fetched && v.jsonValid && v.hashMatches && v.claimsPayment && v.txExists &&
+        v.paymentVerified && v.paymentAttributed,
+    ).length,
     partyMismatch: verdicts.filter((v) => v.partiesContradicted).length,
     foreignChain: verdicts.filter((v) => v.claimsPayment && !v.onQueryableChain).length,
     // Counted apart from `fetched` on purpose: these are the records the audit

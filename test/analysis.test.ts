@@ -11,7 +11,7 @@ import { gini, concentration, findBursts } from '../src/analysis/concentration.j
 import { reconcile, summarize } from '../src/analysis/reconcile.js'
 import { extractPaymentClaim } from '../src/analysis/payment.js'
 import { classifyFailure } from '../src/rpc.js'
-import { collectEvidence } from '../src/report.js'
+import { collectEvidence, renderMarkdown } from '../src/report.js'
 import type { FeedbackRecord } from '../src/sources/feedback.js'
 import type { Settlement } from '../src/sources/settlements.js'
 
@@ -1386,6 +1386,36 @@ check('a document that parsed is a document whose bytes arrived', () => {
   assert.equal(e.fetched, 3)
   assert.equal(e.parsed, 2)
   assert.ok(e.parsed <= e.fetched, 'parsed must never exceed fetched')
+})
+
+/**
+ * The report must refuse to publish a figure it does not have.
+ *
+ * A field the template reads and the result object does not carry rendered as
+ * the literal string "NaN" in a numeric column, beside real measurements and
+ * formatted identically to them.
+ */
+check('a missing figure stops the report instead of printing NaN', () => {
+  const e = collectEvidence([], 0) as Record<string, number>
+  delete (e as { claimsPaymentAnyHash?: number }).claimsPaymentAnyHash
+  const r = {
+    fromBlock: 1, toBlock: 2, fromDate: 'a', toDate: 'b',
+    totalFeedback: 1, revokedFeedback: 0, distinctAgentsRated: 0, registeredAgents: 0,
+    evidence: e,
+    reconciliation: {
+      total: 1, backed: 0, backedRate: 0, paidAfterReview: 0, selfDealing: 0,
+      humanBacked: 0, humanBackedRate: 0, backedAndHumanBacked: 0, unresolvedAgent: 0,
+      backingTopPairs: [], backingPairs: 0, humanBackedTop: [], humanBackedReviewers: 0,
+    },
+    concentration: { distinctReviewers: 0, gini: 0, topTenShare: 0, oneShotReviewerRate: 0, maxBySingleReviewer: 0 },
+    bursts: [], settlementsSeen: 0, settlementsRan: true,
+    retrievalRules: 'x', observedRoot: '0x0', archivedThisRun: 0, selfVerifiedReviewers: 0,
+  }
+  assert.throws(
+    () => renderMarkdown(r as never),
+    /refusing to publish/,
+    'a missing field must stop the render, not become "NaN" in a column of real numbers',
+  )
 })
 
 console.log(`\n${passed} passed (full suite)\n`)
