@@ -33,7 +33,29 @@ async function main() {
   const head = await latestBlock()
   const fromBlock =
     window === 'all' ? REGISTRY_DEPLOY_BLOCK : head - BigInt(Number(window)) * BLOCKS_PER_DAY
-  const toBlock = head
+  /**
+   * A published report has to name a range somebody else can re-run.
+   *
+   * `toBlock` was always the chain head, so every regeneration covered a
+   * different span — Celo produces a block a second — and "every figure is
+   * reproducible: npm run audit" was true of the command and false of the
+   * result. Nobody could reproduce THIS report, only a later one that happened
+   * to disagree slightly.
+   *
+   * AUDIT_TO_BLOCK pins it. The report prints the value to use, so a reader
+   * gets the exact range back rather than an approximation of it.
+   */
+  const pinned = (process.env.AUDIT_TO_BLOCK ?? '').trim()
+  if (pinned && !/^\d+$/.test(pinned)) {
+    console.error(`AUDIT_TO_BLOCK must be a block number; got ${JSON.stringify(pinned)}.`)
+    process.exit(1)
+  }
+  if (pinned && BigInt(pinned) > head) {
+    console.error(`AUDIT_TO_BLOCK=${pinned} is beyond the chain head (${head}).`)
+    process.exit(1)
+  }
+  const toBlock = pinned ? BigInt(pinned) : head
+  if (pinned) console.log(`  pinned to block ${toBlock} (AUDIT_TO_BLOCK)`)
 
   console.log(`Celo Agent Feedback Audit v${AUDIT_VERSION}`)
   console.log(`  blocks ${fromBlock} → ${toBlock}\n`)
@@ -218,7 +240,12 @@ async function main() {
   }
   if (toCheck.length) process.stdout.write('\n')
   if (failedChecks) console.log(`  ${failedChecks} check(s) threw and were dropped — see errors above`)
-  if (archive) console.log(`  archived ${archive.size} distinct evidence files under out/evidence-corpus/`)
+  if (archive) {
+    console.log(
+      `  evidence corpus: ${archive.written} file(s) written by this run, ` +
+        `${archive.size} distinct in the store`,
+    )
+  }
   await closeDispatchers()
 
   const verdicts: EvidenceVerdict[] = [...verdictByRecord.values()]
@@ -236,7 +263,8 @@ async function main() {
   evidence.withPointer = withPointer.length
   // Files this run actually wrote, as distinct from verdicts carrying a
   // content id — a warm resume cache fills the second without fetching.
-  evidence.archivedThisRun = archive ? archive.size : 0
+  evidence.archivedThisRun = archive ? archive.written : 0
+  evidence.corpusSize = archive ? archive.size : 0
   evidence.declaresURI = withPointer.length
   evidence.declaresHash = feedback.filter((f) => f.hasHash).length
   evidence.hashWithoutURI = feedback.filter((f) => f.hasHash && !f.hasURI).length
@@ -256,6 +284,9 @@ async function main() {
     bursts,
     settlementsSeen: settlements.length,
     settlementsRan: ranSettlements,
+    retrievalRules: rules,
+    observedRoot: merkleRoot(feedback.map((f) => recordKey(f.agentId, f.reviewer, f.feedbackIndex))),
+    archivedThisRun: archive ? archive.written : 0,
     selfVerifiedReviewers: reviewers.filter((r) => selfVerified.has(r)).length,
   }
 
@@ -541,7 +572,7 @@ async function main() {
   console.log(
     `\nWrote out/audit.md, out/audit.json, out/samples.json,\n` +
       `      out/claims.csv (${claimRows.length} payment claims) and\n` +
-      `      out/evidence.csv (${evidenceRows.length} records — the full ladder)` +
+      `      out/evidence.csv (${evidenceRows.length} of ${feedback.length} records — every record\n        that declares a URI or a hash; the ${feedback.length - evidenceRows.length} that declare neither\n        have no evidence claim to verify and are left unattested)` +
       (archive ? `\n      out/evidence-corpus/ (${archive.size} archived files, content-addressed)` : ''),
   )
 }

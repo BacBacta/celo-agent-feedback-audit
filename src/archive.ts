@@ -27,6 +27,7 @@ export class EvidenceArchive {
   private readonly dir: string
   private readonly seen = new Set<string>()
   private manifestPath: string
+  private wrote = 0
 
   constructor(dir: string) {
     this.dir = dir
@@ -51,6 +52,7 @@ export class EvidenceArchive {
     if (!deduped) {
       writeFileSync(join(this.dir, 'blobs', `${contentId.slice(2)}.bin`), bytes)
       this.seen.add(contentId)
+      this.wrote += 1
     }
     appendFileSync(
       this.manifestPath,
@@ -65,7 +67,22 @@ export class EvidenceArchive {
     return { contentId, bytes: bytes.byteLength, deduped }
   }
 
+  /**
+   * Distinct blobs in the store, ACROSS ALL RUNS.
+   *
+   * The constructor preloads `seen` from manifest.jsonl, so this is the
+   * cumulative corpus and never what one run produced. It was published as
+   * "N file(s) were written by THIS run" — twice, under two different wrong
+   * numbers: first a count of verdicts carrying a content id, then this. On a
+   * run resumed from a warm verdict cache `put()` is never called at all, and
+   * the sentence still claimed a thousand-odd files had just been written.
+   */
   get size(): number {
     return this.seen.size
+  }
+
+  /** Blobs this run actually wrote to disk. Zero on a fully cached run. */
+  get written(): number {
+    return this.wrote
   }
 }

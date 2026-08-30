@@ -11,6 +11,7 @@ import { gini, concentration, findBursts } from '../src/analysis/concentration.j
 import { reconcile, summarize } from '../src/analysis/reconcile.js'
 import { extractPaymentClaim } from '../src/analysis/payment.js'
 import { classifyFailure } from '../src/rpc.js'
+import { collectEvidence } from '../src/report.js'
 import type { FeedbackRecord } from '../src/sources/feedback.js'
 import type { Settlement } from '../src/sources/settlements.js'
 
@@ -1328,6 +1329,63 @@ check('every module the source imports is one the build actually ships', () => {
       assert.ok(shipped.has(name), `${f} imports ${m[1]}, which src/ does not contain`)
     }
   }
+})
+
+/**
+ * The ladder must not print one measurement as two rungs.
+ *
+ * `fetched` appeared twice: once as "of which the file actually resolved" and
+ * again, four rows lower, as "File retrievable". A reader following the chain
+ * downwards saw 3,560 survive a step it had already been counted through, and
+ * the second label promised a stronger fact — a *resolved file* — than bytes
+ * arriving can support. 1,410 of those 3,560 were not documents at all.
+ */
+check('no ladder row publishes a measure another row already published', () => {
+  const { readFileSync } = FS
+  const src: string = readFileSync('src/report.ts', 'utf8')
+  const table = src.slice(
+    src.indexOf('| Step | Records | Share of all feedback |'),
+    src.indexOf('> **What \\`EvidenceUnreachable\\` contains.**'),
+  )
+  assert.ok(table.length > 200, 'the evidence ladder was not found in report.ts')
+
+  const seen = new Map<string, string>()
+  for (const line of table.split('\n')) {
+    if (!line.startsWith('| ') || line.startsWith('| Step') || line.startsWith('|---')) continue
+    const label = line.split('|')[1]!.trim()
+    const field = /r\.evidence\.([A-Za-z]+)/.exec(line)?.[1]
+    if (!field) continue
+    const prior = seen.get(field)
+    assert.ok(
+      prior === undefined,
+      `the ladder prints r.evidence.${field} as both "${prior}" and "${label}" — ` +
+        'one number cannot be two steps of a chain',
+    )
+    seen.set(field, label)
+  }
+  assert.ok(seen.size >= 5, `only ${seen.size} ladder rows were parsed; the guard is not reading the table`)
+})
+
+/**
+ * And the two retrieval counts must stay ordered.
+ *
+ * `parsed` is a subset of `fetched` by construction. If a refactor ever lets
+ * it exceed, the ladder is describing a chain that gains records as it narrows.
+ */
+check('a document that parsed is a document whose bytes arrived', () => {
+  const v = (fetched: boolean, jsonValid: boolean) => ({
+    hasPointer: true, fetched, jsonValid, hashMatches: false, inconclusive: false,
+    claimsPayment: false, shape: null, proofPresent: false, txExists: false,
+    paymentVerified: false, paymentAttributed: false, partiesContradicted: false,
+    onQueryableChain: true, contentId: null,
+  })
+  const e = collectEvidence(
+    [v(true, true), v(true, false), v(false, false), v(true, true)] as never[],
+    4,
+  )
+  assert.equal(e.fetched, 3)
+  assert.equal(e.parsed, 2)
+  assert.ok(e.parsed <= e.fetched, 'parsed must never exceed fetched')
 })
 
 console.log(`\n${passed} passed (full suite)\n`)

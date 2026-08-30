@@ -16,7 +16,17 @@ export interface AuditResult {
     declaresHash: number
     hashWithoutURI: number
     withPointer: number
+    /** Bytes came back. Says nothing about whether they were a usable document. */
     fetched: number
+    /**
+     * The bytes came back *and* parsed as a JSON object.
+     *
+     * `fetched` was published as "the file actually resolved" and again, in the
+     * same table, as "File retrievable" — one measure printed as two rungs of a
+     * ladder, which made the chain look like it survived a step it never took.
+     * 1,410 of the 3,560 retrievals returned something that was not a document.
+     */
+    parsed: number
     hashMatched: number
     claimsPayment: number
     txExists: number
@@ -25,17 +35,26 @@ export interface AuditResult {
     partyMismatch: number
     foreignChain: number
     inconclusive: number
-    archivedFiles: number
+    /**
+     * Verdicts carrying a content identifier.
+     *
+     * Named `archivedFiles`, which promised a count of files on disk. A warm
+     * resume cache fills this without writing anything, so the two are
+     * unrelated numbers; `archivedThisRun` and `corpusSize` are the file counts.
+     */
+    contentAddressed: number
     /**
      * Files this run actually wrote to disk.
      *
-     * `archivedFiles` counts verdicts carrying a content identifier, which a
+     * `contentAddressed` counts verdicts carrying a content identifier, which a
      * warm resume cache fills without fetching anything — so the sentence
      * "N retrieved files were archived… every verdict stays checkable"
      * described a corpus that could be empty, and on the last run was: 619
      * claimed, 0 files on disk.
      */
     archivedThisRun: number
+    /** Distinct blobs in the store, across every run that has ever archived. */
+    corpusSize: number
     sampled: number
     sampleStride: number
   }
@@ -43,6 +62,14 @@ export interface AuditResult {
   concentration: ConcentrationStats
   bursts: Burst[]
   settlementsSeen: number
+  /**
+   * What produced this report, so a reader can re-derive it rather than
+   * believe it. A census that cannot be re-run to the same range is an
+   * assertion with a table in front of it.
+   */
+  retrievalRules: string
+  observedRoot: string
+  archivedThisRun: number
   /**
    * Whether the sweep was actually attempted.
    *
@@ -65,7 +92,20 @@ export function renderMarkdown(r: AuditResult): string {
 
   return `# Celo Agent Feedback Audit
 
-**Scope.** ERC-8004 Reputation Registry on Celo mainnet, blocks ${r.fromBlock}–${r.toBlock} (${r.fromDate} → ${r.toDate}).
+**Scope.** ERC-8004 Reputation Registry on Celo mainnet, blocks ${r.fromBlock}–${r.toBlock}.
+The first and last feedback records in that span are dated ${r.fromDate} and
+${r.toDate}; the block range extends past the last record to the pinned head, so
+the two are not the same interval and the dates are not the window's edges.
+
+**Provenance.** Retrieval rules \`${r.retrievalRules}\` — the fingerprint of every
+setting that can change a verdict, so a run under different gateways, limits or
+endpoint produces a different one and cannot silently reuse these answers.
+Coverage root \`${r.observedRoot}\` over the ${num(r.totalFeedback)} records
+observed in range: re-index the same blocks, rebuild the root, and a mismatch is
+proof this census is incomplete. The evidence corpus in \`out/evidence-corpus/\`
+holds ${num(r.evidence.corpusSize)} distinct files, content-addressed, of which
+${num(r.archivedThisRun)} were written by this run: a verdict about a file that later
+disappears stays checkable against the bytes it judged, whichever run fetched them.
 
 ## Headline
 
@@ -80,7 +120,7 @@ export function renderMarkdown(r: AuditResult): string {
 | …whose payment is also *attributable* to this reviewer and agent | **${num(r.evidence.paymentAttributed)} (${pct(r.evidence.paymentAttributed, t)})** |
 | …where the reviewer demonstrably paid the agent | **${num(r.reconciliation.backed)} (${pct(r.reconciliation.backed, t)})** |
 | …written by a Self Agent ID holder | **${num(r.reconciliation.humanBacked)} (${pct(r.reconciliation.humanBacked, t)})** |
-| Stablecoin settlements observed between these parties | ${num(r.settlementsSeen)} |
+| Stablecoin transfers sent by these reviewers, to anyone | ${num(r.settlementsSeen)} |
 
 ## What the registry contains
 
@@ -97,16 +137,16 @@ chain breaks.
 
 ${
   r.evidence.sampled < r.evidence.declaresURI
-    ? `> **Sampled, not complete.** ${num(r.evidence.sampled)} of ${num(r.evidence.declaresURI)} records that declare a file were opened — every ${r.evidence.sampleStride}th, evenly spread across the period rather than taken from one end. Every row below from "of which the file actually resolved" downwards is a count **within that sample**, while the percentages are of all feedback: read them as lower bounds. The ${num(r.evidence.declaresURI - r.evidence.sampled)} records that were not opened are exported with the rung \`NotChecked\` and nothing is attested for them.\n\n`
+    ? `> **Sampled, not complete.** ${num(r.evidence.sampled)} of ${num(r.evidence.declaresURI)} records that declare a file were opened — every ${r.evidence.sampleStride}th, evenly spread across the period rather than taken from one end. Every row below from "bytes came back from the pointer" downwards is a count **within that sample**, while the percentages are of all feedback: read them as lower bounds. The ${num(r.evidence.declaresURI - r.evidence.sampled)} records that were not opened are exported with the rung \`NotChecked\` and nothing is attested for them.\n\n`
     : ''
 }| Step | Records | Share of all feedback |
 |---|---|---|
 | Declares a \`feedbackURI\` | ${num(r.evidence.declaresURI)} | ${pct(r.evidence.declaresURI, t)} |
-| …of which the file actually resolved | ${num(r.evidence.fetched)} | ${pct(r.evidence.fetched, t)} |
 | Declares a non-zero \`feedbackHash\` | ${num(r.evidence.declaresHash)} | ${pct(r.evidence.declaresHash, t)} |
 | Hash attested but no file published | ${num(r.evidence.hashWithoutURI)} | ${pct(r.evidence.hashWithoutURI, t)} |
-| File retrievable | ${num(r.evidence.fetched)} | ${pct(r.evidence.fetched, t)} |
-| File matches the attested hash | ${num(r.evidence.hashMatched)} | ${pct(r.evidence.hashMatched, t)} |
+| …bytes came back from the pointer | ${num(r.evidence.fetched)} | ${pct(r.evidence.fetched, t)} |
+| …and those bytes parsed as a JSON document | ${num(r.evidence.parsed)} | ${pct(r.evidence.parsed, t)} |
+| …and the document matches the attested hash | ${num(r.evidence.hashMatched)} | ${pct(r.evidence.hashMatched, t)} |
 | Contains a payment claim | ${num(r.evidence.claimsPayment)} | ${pct(r.evidence.claimsPayment, t)} |
 | Claimed transaction exists on chain | ${num(r.evidence.txExists)} | ${pct(r.evidence.txExists, t)} |
 | Payment verified — exists, succeeded, moved value | **${num(r.evidence.paymentVerified)}** | **${pct(r.evidence.paymentVerified, t)}** |
@@ -114,11 +154,21 @@ ${
 | Payment cited but its parties contradict the claim | ${num(r.evidence.partyMismatch)} | ${pct(r.evidence.partyMismatch, t)} |
 | Payment declared on a chain this audit does not query | ${num(r.evidence.foreignChain)} | ${pct(r.evidence.foreignChain, t)} |
 
+> **What \`EvidenceUnreachable\` contains.** The rung is not a synonym for 404.
+> It holds three different failures: a host that answered with an HTTP error, a
+> host that answered with something that was not a JSON document (an HTML
+> landing page or soft-404 — ${num(r.evidence.fetched - r.evidence.parsed)} of them, counted in
+> "bytes came back" above and nowhere below it), and a pointer whose scheme this
+> audit cannot resolve at all. Only the first is the host saying the file is
+> gone. \`out/evidence.csv\` carries the reason per record in its \`note\` column.
+
 > **Not a finding:** ${num(r.evidence.inconclusive)} records could not be retrieved for
 > reasons that prove nothing — rate limits, timeouts, gateway outages. They are
 > excluded from the dead-link count above rather than folded into it. A file
 > this audit failed to reach is a question it failed to ask, not an answer.
-> ${num(r.evidence.archivedFiles)} verdicts carry a content identifier, and ${num(r.evidence.archivedThisRun)} file(s) were written by THIS run under
+> The corpus holds ${num(r.evidence.corpusSize)} distinct evidence files, of which
+> ${num(r.evidence.archivedThisRun)} were written by this run — the rest were archived by earlier
+> runs and reused, and a run resumed entirely from cache writes none. Under
 > \`out/evidence-corpus/\`, so every verdict above stays checkable after the
 > originals go offline.
 
@@ -136,6 +186,37 @@ agent's owner, in a stablecoin, before rating it?
 | Reviewer owns the agent it reviewed | ${num(r.reconciliation.selfDealing)} | ${pct(r.reconciliation.selfDealing, t)} |
 | Paid **and** human-backed | ${num(r.reconciliation.backedAndHumanBacked)} | ${pct(r.reconciliation.backedAndHumanBacked, t)} |
 
+### …and how few relationships that rests on
+
+One review in five being backed by a real payment is exact, and on its own it
+suggests a broad market. It is not one. The ${num(r.reconciliation.backed)}
+backed records come from **${num(r.reconciliation.backingPairs)} distinct
+reviewer→owner relationships**, and they are distributed like this:
+
+| Relationship | Backed records | Share of backed |
+|---|---|---|
+${r.reconciliation.backingTopPairs
+  .map((p) => `| \`${p.reviewer.slice(0, 10)}…\` → \`${p.owner.slice(0, 10)}…\` | ${num(p.records)} | ${(p.share * 100).toFixed(1)}% |`)
+  .join('\n')}
+
+${r.reconciliation.backingTopPairs.length
+  ? `The largest single relationship carries **${(r.reconciliation.backingTopPairs[0]!.share * 100).toFixed(0)}%** of the backed records, and the top five carry **${(r.reconciliation.backingTopPairs.reduce((a, p) => a + p.share, 0) * 100).toFixed(0)}%**. Read the headline as "a few operators pay, and almost nobody else does" rather than as a market rate.`
+  : ''}
+
+### The same question, asked of the Self-ID figure
+
+${num(r.reconciliation.humanBacked)} records were written by an address holding a
+Self Agent ID. That is **${num(r.reconciliation.humanBackedReviewers)} distinct
+addresses**${r.reconciliation.humanBackedTop.length ? `, of which the largest wrote ${num(r.reconciliation.humanBackedTop[0]!.records)} — ${(r.reconciliation.humanBackedTop[0]!.share * 100).toFixed(0)}% of the figure` : ''}.
+Read it as "a handful of verified operators are prolific", not as "one review in
+eight came from a verified human", which is what the percentage alone suggests.
+
+| Self-ID reviewer | Records | Share of the figure |
+|---|---|---|
+${r.reconciliation.humanBackedTop
+  .map((h) => `| \`${h.reviewer.slice(0, 10)}…\` | ${num(h.records)} | ${(h.share * 100).toFixed(1)}% |`)
+  .join('\n')}
+
 ## Concentration
 
 Same measures as the arXiv ERC-8004 study (2606.26028, June 2026), which covered
@@ -149,16 +230,42 @@ to the published ones.
 
 ## Temporal clustering
 
-${r.bursts.length} clusters of ≥5 reviews within a 5-minute window, totalling
-**${num(burstEvents)} records (${pct(burstEvents, t)} of all feedback)** and
-${num(burstOneShot)} reviewers that never reviewed anything again.
+${r.bursts.length} clusters of ≥5 reviews within a 5-minute window. Those
+clusters hold **${num(burstEvents)} records (${pct(burstEvents, t)} of all
+feedback)**. Separately, ${num(burstOneShot)} of the addresses writing inside
+them never reviewed anything again — a count of reviewers, not of the records
+above, and the two must not be read as one figure.
 
 A genuinely busy hour looks like this too. These are reported for inspection,
 not labelled fraudulent.
 
 ## Method and limits
 
-- Every figure is reproducible: \`npm run audit\` against any Celo RPC.
+- **What is reproducible, and what is not.** Re-run with:
+
+  \`\`\`
+  AUDIT_TO_BLOCK=${r.toBlock} SKIP_SETTLEMENTS=0 MAX_FILE_FETCHES=100000 npm run audit
+  \`\`\`
+
+  Without the pin, \`npm run audit\` follows the chain head — Celo produces a
+  block a second — so a re-run covers a different span and disagrees slightly
+  with the numbers above. The pin is what makes disagreement meaningful.
+
+  Everything derived from the chain reproduces exactly: the record count, the
+  coverage root, the ladder rows that read the event alone, the concentration
+  and clustering figures, and every payment verdict, which is a transaction
+  receipt lookup. Three things do not, and saying "every figure is reproducible"
+  concealed all three. **Retrieval outcomes depend on the network at the moment
+  of the run**: a host that times out today answers tomorrow, and the record
+  moves between \`EvidenceInconclusive\` and a documentary rung — the
+  ${num(r.evidence.inconclusive)} inconclusive records are precisely the ones
+  whose verdict is a property of the run. **The corpus counters are
+  cache-relative by construction**: a re-run resumed from a warm verdict cache
+  writes nothing and reports zero newly archived, which is correct and not
+  comparable. **The RPC endpoint is not pinned by that command** — set
+  \`CELO_RPC_URL\` to the endpoint you want; it is part of the retrieval
+  fingerprint above, so a different one refuses to reuse this run's cache rather
+  than silently mixing the two.
 - Payment detection covers USDC, USDT and USAT — the assets the Celo x402
   facilitator settles. Payments in other assets, or routed through a contract
   rather than sent directly, are not counted, so the payment-backed rate is a
@@ -194,6 +301,7 @@ export function collectEvidence(verdicts: EvidenceVerdict[], sampled: number) {
     sampleStride: 1,
     withPointer: verdicts.filter((v) => v.hasPointer).length,
     fetched: verdicts.filter((v) => v.fetched).length,
+    parsed: verdicts.filter((v) => v.fetched && v.jsonValid).length,
     hashMatched: verdicts.filter((v) => v.hashMatches).length,
     claimsPayment: verdicts.filter((v) => v.claimsPayment).length,
     txExists: verdicts.filter((v) => v.txExists).length,
@@ -205,8 +313,9 @@ export function collectEvidence(verdicts: EvidenceVerdict[], sampled: number) {
     // failed to reach, not the records it found dead. Reporting them inside the
     // dead-link figure is how a transport problem becomes a published finding.
     inconclusive: verdicts.filter((v) => v.inconclusive).length,
-    archivedFiles: verdicts.filter((v) => v.contentId !== null).length,
+    contentAddressed: verdicts.filter((v) => v.contentId !== null).length,
     archivedThisRun: 0,
+    corpusSize: 0,
     sampled,
   }
 }
