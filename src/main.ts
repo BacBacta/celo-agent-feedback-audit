@@ -547,13 +547,36 @@ async function main() {
    * component that knows the observed set, and the writer merely carries it.
    */
   const observedKeys = feedback.map((f) => recordKey(f.agentId, f.reviewer, f.feedbackIndex))
-  writeFileSync('out/observed-keys.txt', [...new Set(observedKeys)].sort().join('\n') + '\n')
+  const distinctKeys = [...new Set(observedKeys)].sort()
+  writeFileSync('out/observed-keys.txt', distinctKeys.join('\n') + '\n')
+  /**
+   * `observed` counts records; the root commits to distinct keys.
+   *
+   * They are the same number here and are not the same number by construction:
+   * `merkleRoot` dedupes, so two records sharing an (agentId, reviewer,
+   * feedbackIndex) triple would be one leaf and two in the count. That gap
+   * would be published on chain as a coverage claim, where a verifier counting
+   * leaves and a verifier reading `observed` would reach different conclusions
+   * about the same run and neither would be told why. If it ever opens, the
+   * manifest says so out loud rather than carrying two figures that quietly
+   * describe different sets.
+   */
+  const duplicateKeys = observedKeys.length - distinctKeys.length
+  if (duplicateKeys > 0) {
+    console.warn(
+      `\n  ! ${duplicateKeys} feedback record(s) share an (agentId, reviewer, feedbackIndex)` +
+        '\n    triple. The coverage root commits to distinct keys, so it has fewer leaves' +
+        '\n    than `observed` counts records. Both numbers are in out/sweep.json.',
+    )
+  }
   writeFileSync(
     'out/sweep.json',
     JSON.stringify({
       fromBlock: fromBlock.toString(),
       toBlock: toBlock.toString(),
       observed: feedback.length,
+      /** Leaves in the root below. Equal to `observed` unless a triple repeats. */
+      observedDistinct: distinctKeys.length,
       observedRoot: merkleRoot(observedKeys),
       declaringEvidence: withPointer.length,
       exportedRows: evidenceRows.length,
