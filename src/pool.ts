@@ -7,9 +7,17 @@
  * group. A pool lets each worker take the next item the moment it finishes its
  * own, so its rate is set by the mean.
  *
- * With one slow item in every group of eight and a 45-second ceiling on it,
- * those two rates differ by roughly six times. That is the difference between
- * a full evidence pass taking an afternoon and taking a night.
+ * How much that is worth depends entirely on the spread. With one slow item in
+ * every group of eight and a 45-second ceiling on it, the two rates differ by
+ * roughly six times. With every item slow they converge, and the pool buys
+ * almost nothing: measured on this registry's tail — where what remains is
+ * unpinned IPFS content that no gateway answers — the rate went from 10.7 to
+ * 12 records a minute, about 12%.
+ *
+ * Both numbers are real and neither is the headline. The barrier's cost is a
+ * property of the latency distribution, not a constant, and quoting the
+ * favourable case as though it described every workload is the same error this
+ * repository exists to object to.
  *
  * `next++` is safe without a lock because there is no `await` between reading
  * the index and incrementing it: on a single-threaded event loop that pair is
