@@ -73,11 +73,28 @@ export async function loadSettlementsFrom(
   }
   process.stdout.write('\n')
 
-  // Mark which transfers were gasless EIP-3009 settlements. AuthorizationUsed is
-  // rare enough to sweep directly, and joining on txHash avoids one receipt
-  // fetch per transfer.
+  /**
+   * Mark which transfers were gasless EIP-3009 settlements — off by default.
+   *
+   * AuthorizationUsed carries no topic filter, so each token is a full-history
+   * pass at roughly a third the speed of a filtered one: measured at 146,640
+   * blocks per minute against 475,000, which is about two hours per token and
+   * four hours for the three of them.
+   *
+   * Nothing reads the field it fills. `gaslessAuthorized` is written here and
+   * consumed by no reconciliation, no report line and no export column — a
+   * grep across src/ finds this file and nothing else. So the default run
+   * spent half its time producing a value no published figure depends on.
+   *
+   * The capability is kept because the question it answers is a real one, and
+   * the caches from a previous sweep are still on disk. It is opt-in now.
+   */
   const authTxs = new Set<string>()
-  for (const token of SETTLEMENT_TOKENS) {
+  const sweepAuth = process.env.SWEEP_AUTHORIZATIONS === '1'
+  if (!sweepAuth) {
+    console.log('  authorizations: skipped — nothing reads gaslessAuthorized (SWEEP_AUTHORIZATIONS=1 to sweep)')
+  }
+  for (const token of sweepAuth ? SETTLEMENT_TOKENS : []) {
     const logs = await getLogsChunked({
       address: token.address,
       event: AUTHORIZATION_USED_EVENT,
