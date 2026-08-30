@@ -1,7 +1,7 @@
 {
   "name": "celo-agent-feedback-audit",
   "version": "0.4.0",
-  "description": "Measures how much of the ERC-8004 agent reputation on Celo mainnet is backed by verifiable evidence — and how much is not.",
+  "description": "Measures how much of the ERC-8004 agent reputation on Celo mainnet is backed by verifiable evidence \u2014 and how much is not.",
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -15,7 +15,8 @@
     "typecheck": "tsc --noEmit",
     "counter-checks": "node counter-checks.mjs",
     "crosscheck": "node crosscheck.mjs",
-    "verify-parties": "node verify-parties.mjs"
+    "verify-parties": "node verify-parties.mjs",
+    "publish-report": "node publish-report.mjs"
   },
   "dependencies": {
     "undici": "^8.10.0",

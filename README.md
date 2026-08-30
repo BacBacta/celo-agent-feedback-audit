@@ -79,6 +79,21 @@ npm test         # analysis unit tests, no network needed (needs tsx)
 npm run typecheck
 ```
 
+## Published runs
+
+Completed full-history runs are snapshotted under [`docs/`](docs/), named by the
+block they were pinned to and the retrieval rules that decided their verdicts —
+`audit-<toBlock>-<rules>.md`, with the machine-readable result beside it.
+
+Both halves of that name matter. Two runs over different block ranges are
+different measurements and must not share a filename; two runs over the same
+range under different retrieval rules are also different measurements, because
+what counts as a dead file is a property of how it was asked for. `npm run
+publish-report` writes the snapshot, refuses an output missing either field,
+and refuses to overwrite an existing snapshot whose content differs — the same
+range under the same rules producing two different reports is a finding about
+this tool, not a file to replace.
+
 ## Checking the audit's own answers
 
 Three of the objections this tool's counter-analysis raised are answerable from
@@ -120,14 +135,22 @@ the distinction is the difference between a finding and a failure to measure:
 | Outcome | Meaning | Is it a finding? |
 |---|---|---|
 | `EvidenceUnreachable` | a host answered **404 or 410** — it asserts the file is absent | yes |
+| `EvidenceUnreachable` | bytes came back and were **not a JSON document** — an HTML landing page, a soft-404, plain text | yes — there is no evidence file at that pointer |
 | `EvidenceUnreachable` | the URI itself is unusable: unknown scheme, malformed, or pointing into private address space | yes — decided locally, no network involved |
 | `EvidenceInconclusive` | rate limit, timeout, 403, 5xx, every gateway busy, oversize body, or beyond the sampling cap | **no** |
 | `EvidenceUnhashed` | the file resolved and does not match its attested digest | yes, but see below |
 
-Only 404 and 410 are read as absence. A 403 from a WAF, a 401 from a gateway
-wanting a key, a 451 block — those mean "I will not serve you this", not "there
-is nothing here", and counting them as dead links would fabricate findings about
-files that are alive. A body above the cap is inconclusive for the same reason:
+One rung, three different failures, and they are not interchangeable. On the
+full-history run they split 3,305 / 1,410 / 193 — so reading
+`EvidenceUnreachable` as "404" attributes to absent hosts a third of a count
+that is mostly about hosts answering with the wrong thing. `out/evidence.csv`
+carries the reason per record in its `note` column; the published report prints
+the split.
+
+Of the HTTP statuses, only 404 and 410 are read as absence. A 403 from a WAF, a
+401 from a gateway wanting a key, a 451 block — those mean "I will not serve you
+this", not "there is nothing here", and counting them as dead links would
+fabricate findings about files that are alive. A body above the cap is inconclusive for the same reason:
 something is served there, we simply declined to read all of it, and a
 mendacious `Content-Length` must not be able to manufacture a verdict.
 
