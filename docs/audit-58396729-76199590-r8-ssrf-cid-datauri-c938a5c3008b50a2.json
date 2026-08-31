@@ -26,8 +26,9 @@
     "inconclusive": 3376,
     "contentAddressed": 3563,
     "archivedThisRun": 0,
-    "corpusSize": 2035,
+    "corpusSize": 1712,
     "corpusRecorded": 2035,
+    "corpusNotStored": 323,
     "inconclusiveTopHosts": [
       {
         "host": "ipfs:// (no gateway served it)",

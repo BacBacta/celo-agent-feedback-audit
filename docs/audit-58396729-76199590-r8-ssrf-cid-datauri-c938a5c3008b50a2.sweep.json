@@ -1,0 +1,13 @@
+{
+  "fromBlock": "58396729",
+  "toBlock": "76199590",
+  "observed": 27520,
+  "observedDistinct": 27520,
+  "observedRoot": "0x497f7b3a06a5a5175d803f4a356b9fd445586507de44ce670459ad7d19dfce12",
+  "declaringEvidence": 10469,
+  "exportedRows": 20097,
+  "auditVersion": "0.4.0",
+  "retrievalRulesName": "r8-ssrf-cid-datauri",
+  "retrievalRules": "c938a5c3008b50a2",
+  "producedAt": "2026-08-31T05:57:41.195Z"
+}

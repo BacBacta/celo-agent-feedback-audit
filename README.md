@@ -96,7 +96,16 @@ npm run typecheck
 
 **Latest:** [blocks 58,396,729–76,199,590](docs/audit-58396729-76199590-r8-ssrf-cid-datauri-c938a5c3008b50a2.md)
 — 27,520 feedback records, February to August 2026, every declared evidence file
-opened. ([machine-readable](docs/audit-58396729-76199590-r8-ssrf-cid-datauri-c938a5c3008b50a2.json))
+opened. Published with the rows it was found from:
+[`.json`](docs/audit-58396729-76199590-r8-ssrf-cid-datauri-c938a5c3008b50a2.json) (the same
+figures, machine-readable),
+[`.evidence.csv`](docs/audit-58396729-76199590-r8-ssrf-cid-datauri-c938a5c3008b50a2.evidence.csv)
+(20,097 rows, one per record that declares a URI or a hash — this is what the
+attestation ledger is written from),
+[`.claims.csv`](docs/audit-58396729-76199590-r8-ssrf-cid-datauri-c938a5c3008b50a2.claims.csv)
+(the 94 payment claims) and
+[`.sweep.json`](docs/audit-58396729-76199590-r8-ssrf-cid-datauri-c938a5c3008b50a2.sweep.json)
+(the coverage manifest `commitSweep` publishes).
 
 Completed runs are snapshotted under [`docs/`](docs/) as
 `audit-<fromBlock>-<toBlock>-<rules>-<fingerprint>.md`, with the
@@ -109,6 +118,13 @@ both endpoints are there. Two runs over the same range under different retrieval
 rules are also different measurements, because what counts as a dead file is a
 property of how it was asked for; the rules *name* says which semantics decided
 the verdicts and the *fingerprint* digests every setting that could change one.
+
+The export travels with the report because publishing one without the other
+makes the aggregate checkable only by re-running the whole audit — and `out/` is
+gitignored, so it existed on exactly one machine. That was not theoretical: a
+backfill on a second machine read that machine's own months-old export, which
+predated the `feedbackIndex` and `observedAt` columns, and every one of its
+20,097 rows was rejected.
 
 `npm run publish-report` writes the snapshot and refuses in three cases: an
 output missing its provenance fields, an `audit.md` that does not mention the
