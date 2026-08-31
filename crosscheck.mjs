@@ -18,12 +18,40 @@
  *   3. Claims — re-verify every claimed payment tx in out/claims.csv against
  *      Blockscout, a different data source from the RPC used by the audit.
  *
- * Optionally set CROSSCHECK_RPC to a second provider for step 2 to make the
- * recount fully independent of the original endpoint too.
+ * INDEPENDENCE IS NOT AUTOMATIC. Step 2 is only a cross-check if CROSSCHECK_RPC
+ * names a different provider from the one the audit used; left unset it re-asks
+ * the same node the same question and agrees with itself. Step 3 queries
+ * Blockscout's REST API, which is a different service but the same operator as
+ * the indexer the audit is recommended to read events from — so it cross-checks
+ * the transport, not the operator. Both limits are printed at startup rather
+ * than left for a reader to discover, and the script refuses to describe itself
+ * as independent when it is not.
  */
 import fs from 'node:fs'
+import { parseCsvStrict } from './src/csv.mjs'
 
-const RPC = process.env.CROSSCHECK_RPC ?? process.env.CELO_RPC_URL ?? 'https://forno.celo.org'
+const AUDIT_RPC = process.env.CELO_RPC_URL ?? 'https://forno.celo.org'
+const RPC = process.env.CROSSCHECK_RPC ?? AUDIT_RPC
+
+/**
+ * State the independence achieved before printing any number that depends on it.
+ * A cross-check that silently re-queries the audit's own endpoint produces
+ * agreement and calls it corroboration.
+ */
+const INDEPENDENT = process.env.CROSSCHECK_RPC != null && process.env.CROSSCHECK_RPC !== AUDIT_RPC
+console.log(`\ncrosscheck`)
+console.log(`  audit endpoint       ${AUDIT_RPC}`)
+console.log(`  crosscheck endpoint  ${RPC}`)
+if (INDEPENDENT) {
+  console.log('  independence         YES — a second provider answers the recount')
+} else {
+  console.log('  independence         NO  — same endpoint as the audit.')
+  console.log('                       Agreement below is self-agreement, not corroboration.')
+  console.log('                       Set CROSSCHECK_RPC to a different provider.')
+}
+console.log(`  claim re-check       Blockscout REST (different service, same operator as the`)
+console.log(`                       recommended event indexer — transport-independent only)`)
+
 const CACHE = process.env.FEEDBACK_CACHE ?? 'data/feedback-58396729.jsonl'
 const REGISTRY = '0x8004BAa17C55a88189AE136b182e5fdA19dE9b63'
 const TOPIC0 = '0x6a4a61743519c9d648a14e6493f47dbe3ff1aa29e7785c96c8326a205e58febc'
@@ -120,21 +148,48 @@ console.log('\n3. Claimed payment transactions vs Blockscout')
 if (!fs.existsSync('out/claims.csv')) {
   console.log('   out/claims.csv not found — re-run the audit (v0.2.0+) to produce it, then re-run this.')
 } else {
-  const rows = fs.readFileSync('out/claims.csv', 'utf8').split('\n').slice(1).filter(Boolean)
+  /**
+   * Read by column NAME, through the shared parser.
+   *
+   * This block used to destructure positionally — `[, , , , , txHash, txExists]`
+   * — against a header that has since gained columns. Position 5 became
+   * `claimNetwork`, which never matches a transaction hash, so every row took
+   * the "malformed: nothing to look up" branch and was counted as agreement.
+   * The result was a cross-check that reported perfect corroboration from a
+   * second source without ever contacting one.
+   */
+  const { rows, malformed } = parseCsvStrict(fs.readFileSync('out/claims.csv', 'utf8'))
+  if (malformed.length) console.log(`   ! ${malformed.length} malformed row(s) skipped`)
+  for (const col of ['claimTxHash', 'txExistsOnCelo']) {
+    if (rows.length && !(col in rows[0])) {
+      console.log(`   out/claims.csv has no ${col} column — re-run the audit before cross-checking.`)
+      rows.length = 0
+    }
+  }
   let agree = 0
   let disagree = 0
+  let skipped = 0
   for (const row of rows) {
-    const cols = row.split('","').map((c) => c.replace(/^"|"$/g, '').replace(/""/g, '"'))
-    const [, , , , , txHash, txExists] = cols
-    if (!/^0x[0-9a-fA-F]{64}$/.test(txHash)) { agree++; continue }  // malformed: nothing to look up
+    const txHash = (row.claimTxHash ?? '').trim()
+    if (!/^0x[0-9a-fA-F]{64}$/.test(txHash)) { skipped++; continue } // malformed: nothing to look up
     const res = await fetch(`https://celo.blockscout.com/api/v2/transactions/${txHash}`)
+    if (res.status !== 200 && res.status !== 404) {
+      // Never let a rate limit or an outage count as a verdict either way.
+      console.log(`   ? ${txHash} — Blockscout answered HTTP ${res.status}; no conclusion drawn`)
+      skipped++
+      await sleep(1000)
+      continue
+    }
     const existsOnBlockscout = res.status === 200
-    const auditSaidExists = txExists === 'true'
+    const auditSaidExists = row.txExistsOnCelo === 'true'
     if (existsOnBlockscout === auditSaidExists) agree++
     else { disagree++; console.log(`   DISAGREE ${txHash} — audit: ${auditSaidExists}, blockscout: ${existsOnBlockscout}`) }
     await sleep(250)
   }
-  console.log(`   ${rows.length} claims re-checked against a second source: ${agree} agree, ${disagree} disagree`)
+  console.log(`   ${rows.length} claims: ${agree} agree, ${disagree} disagree, ${skipped} not looked up`)
+  if (agree + disagree === 0 && rows.length) {
+    console.log('   NOTHING was actually re-checked against a second source.')
+  }
 }
 
 console.log('\nVerdict:')

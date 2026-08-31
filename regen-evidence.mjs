@@ -10,17 +10,36 @@
  * of downloads would reproduce exactly this.
  */
 import { readFileSync, writeFileSync, existsSync, copyFileSync } from 'node:fs'
+import { parseCsvStrict, escapeCell } from './src/csv.mjs'
 
 const SRC = 'out/evidence.csv'
 const CACHE = process.env.FEEDBACK_CACHE ?? 'data-bs/feedback-58396729.jsonl'
 const TS = process.env.TS_CACHE ?? 'data-bs/timestamps.json'
 const ZERO = /^0x0+$/
 
-// ---- parse the existing export (quoted rows, plain header) ----
-const lines = readFileSync(SRC, 'utf8').split('\n').filter(Boolean)
-const header = lines[0].split(',')
-const parse = (l) => l.slice(1, -1).split('","').map((c) => c.replace(/""/g, '"'))
-const rows = lines.slice(1).map((l) => Object.fromEntries(header.map((k, i) => [k, parse(l)[i] ?? ''])))
+// ---- parse the existing export ----
+// The shared parser, not a hand-rolled split: the previous one broke on any
+// quoted field containing a comma or a newline, and this file's input is
+// attacker-influenced.
+const raw = readFileSync(SRC, 'utf8')
+const { header, rows, malformed } = parseCsvStrict(raw)
+if (malformed.length) {
+  console.error(`${malformed.length} malformed row(s); first at line ${malformed[0].line}. Refusing to rewrite.`)
+  process.exit(1)
+}
+
+/**
+ * This tool migrates the OLD export to the corrected ladder. The current
+ * pipeline writes that ladder directly, with columns this script knows nothing
+ * about (attribution, the evidence dimension, the archived content id) — and
+ * re-deriving rungs here from a stale copy of the rules is precisely how two
+ * implementations of one ladder drift apart without anyone noticing.
+ */
+if (header.includes('paymentAttributed') || header.includes('evidenceRung')) {
+  console.error('This export already carries the current schema.')
+  console.error('Re-deriving it here would fork the ladder — run `npm run audit` instead.')
+  process.exit(1)
+}
 
 function rung(o) {
   const jsonValid = o.jsonValid !== undefined ? o.jsonValid === 'true' : (o.fetched === 'true' && o.note !== 'not JSON')
@@ -65,7 +84,7 @@ for (const line of readFileSync(CACHE, 'utf8').split('\n').filter(Boolean)) {
 
 // ---- write back ----
 const OUT_HEADER = 'timestamp,block,agentId,reviewer,rung,hasURI,fetched,jsonValid,hashMatched,claimsPayment,txExistsOnCelo,paymentVerified,claimTxHash,evidenceHash,note,feedbackURI'
-const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`
+const esc = escapeCell
 const emit = (o) => OUT_HEADER.split(',').map((k) => esc(o[k] ?? (k === 'rung' ? rung(o) : ''))).join(',')
 
 const corrected = rows.map((o) => ({ ...o, jsonValid: o.jsonValid ?? (o.fetched === 'true' && o.note !== 'not JSON' ? 'true' : 'false'), rung: rung(o) }))

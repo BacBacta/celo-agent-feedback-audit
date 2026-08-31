@@ -1,9 +1,29 @@
+import { createHash } from 'node:crypto'
 import { mkdirSync, existsSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs'
 import { createPublicClient, http, type AbiEvent, type Address } from 'viem'
 import { celo } from 'viem/chains'
-import { LOG_CHUNK_SIZE } from './config.js'
+import { LOG_CHUNK_SIZE, TRUNCATION_SUSPECT } from './config.js'
 
-const RPC_URL = process.env.CELO_RPC_URL ?? 'https://forno.celo.org'
+/**
+ * A database-backed indexer by default, not the public gateway.
+ *
+ * forno.celo.org is a load-balanced cluster whose nodes hold divergent log
+ * indexes: asked the same immutable range three times it answered 46, 40 and
+ * 37 events where this endpoint answered 77. A default that silently drops half
+ * the history is not a defensible default, however convenient — and the
+ * determinism check below now refuses to run on it anyway, so keeping it would
+ * only mean every first run fails with an instruction to change it.
+ *
+ * forno remains one CELO_RPC_URL away for anyone who wants to reproduce that.
+ */
+const RPC_URL = process.env.CELO_RPC_URL ?? 'https://celo.blockscout.com/api/eth-rpc'
+
+/**
+ * Indexer endpoints speak single-request JSON-RPC only, so batching must be off
+ * for them. Inferring it from the URL removes a second environment variable
+ * that, forgotten, produces a wall of unexplained failures.
+ */
+const BATCH_DEFAULT = !/\/api\/eth-rpc\/?$/.test(RPC_URL)
 const CONCURRENCY = Math.max(1, Number(process.env.RPC_CONCURRENCY ?? 5))
 const CACHE_DIR = process.env.CACHE_DIR ?? 'data'
 
@@ -17,7 +37,7 @@ const CACHE_DIR = process.env.CACHE_DIR ?? 'data'
 export const client = createPublicClient({
   chain: celo,
   transport: http(RPC_URL, {
-    batch: process.env.RPC_BATCH !== '0',
+    batch: process.env.RPC_BATCH === undefined ? BATCH_DEFAULT : process.env.RPC_BATCH !== '0',
     retryCount: 5,
     retryDelay: 400,
   }),
@@ -57,6 +77,85 @@ export async function throughRateLimit<T>(what: string, fn: () => Promise<T>): P
       await sleep(ms)
     }
   }
+}
+
+/**
+ * Refuse to audit through an endpoint that answers differently each time.
+ *
+ * `eth_getLogs` over a range of blocks that were mined months ago has exactly
+ * one correct answer, and a load-balanced cluster of nodes with divergent log
+ * indexes does not have to give it. Measured against forno on 2026-08-29, over
+ * one immutable 60,000-block range: three consecutive passes returned 46, 40
+ * and 37 events, where a database-backed indexer returned 77. Between 40% and
+ * 52% of the history silently absent, differently every time, with no error
+ * raised anywhere.
+ *
+ * An audit that reports a clean number from that is worse than one that fails:
+ * the number looks finished. So the endpoint is asked the same immutable
+ * question twice before anything is indexed, and a disagreement stops the run.
+ *
+ * This cannot prove an endpoint complete — an indexer that is consistently
+ * wrong passes — which is why the cross-check against a second provider still
+ * exists. It only catches the endpoint that cannot agree with itself, and that
+ * turned out to be the default.
+ */
+export async function assertDeterministicLogs(params: {
+  address: Address
+  event: AbiEvent
+  fromBlock: bigint
+  toBlock: bigint
+}): Promise<void> {
+  if (process.env.SKIP_DETERMINISM_CHECK === '1') {
+    console.log('  determinism check: SKIPPED (SKIP_DETERMINISM_CHECK=1)')
+    return
+  }
+
+  // Stay well behind the head: recent blocks may legitimately still be settling.
+  const ceiling = params.toBlock - 50_000n
+  if (ceiling <= params.fromBlock) return
+
+  const span = LOG_CHUNK_SIZE
+  const ask = (from: bigint) =>
+    throughRateLimit('determinism', () =>
+      client.getLogs({
+        address: params.address,
+        event: params.event,
+        fromBlock: from,
+        toBlock: from + span - 1n,
+      }),
+    )
+
+  // Find a probe window that actually contains events; an empty one agrees
+  // with itself for free and proves nothing.
+  let probe: bigint | null = null
+  let first: unknown[] = []
+  for (let at = params.fromBlock; at < ceiling && probe === null; at += span * 40n) {
+    const logs = await ask(at)
+    if (logs.length > 0) { probe = at; first = logs }
+  }
+  if (probe === null) {
+    console.log('  determinism check: no events found to probe with — skipped')
+    return
+  }
+
+  const second = await ask(probe)
+  if (second.length === first.length) {
+    console.log(`  determinism check: ${first.length} events, twice, over blocks ${probe}–${probe + span - 1n} ✓`)
+    return
+  }
+
+  const third = await ask(probe)
+  throw new Error(
+    `The RPC endpoint is not deterministic over immutable history.\n` +
+      `  endpoint  ${RPC_URL}\n` +
+      `  blocks    ${probe}–${probe + span - 1n} (mined long ago; the answer cannot change)\n` +
+      `  answers   ${first.length}, ${second.length}, ${third.length} events\n` +
+      `A load-balanced cluster whose nodes hold divergent log indexes will\n` +
+      `undercount silently, and the audit would publish that shortfall as a\n` +
+      `finding about the registry. Use a database-backed indexer:\n` +
+      `  CELO_RPC_URL=https://celo.blockscout.com/api/eth-rpc RPC_BATCH=0 npm run audit\n` +
+      `Set SKIP_DETERMINISM_CHECK=1 only to reproduce a known-bad run deliberately.`,
+  )
 }
 
 export async function latestBlock(): Promise<bigint> {
@@ -102,6 +201,121 @@ export function classifyFailure(err: unknown): FailureKind {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 /**
+ * What to do with a cache on disk, decided without touching the disk.
+ *
+ * Pulled out of `getLogsChunked` so the decision can be tested exhaustively
+ * rather than asserted against the shape of the source. Four of this file's
+ * regressions lived in this decision and every one of them was a case nobody
+ * had enumerated: an over-full logs file treated as truncation, a legacy state
+ * with no logs read as a proven zero, a declined resume that left its stale
+ * logs in place, and a fingerprint stamped onto content it had just warned it
+ * could not verify.
+ */
+export type ResumeDecision =
+  | { action: 'refuse'; reason: string }
+  | { action: 'resweep'; warn?: string; truncateLogs: boolean; stampQuery: boolean }
+  | { action: 'resume'; at: bigint; truncateLogs: false; stampQuery: boolean; warn?: string }
+
+export function resumeDecision(input: {
+  state: CacheState | null
+  fromBlock: bigint
+  toBlock: bigint
+  queryTag: string
+  filtered: boolean
+  logsPresent: boolean
+  logLines: number
+  cacheKey: string
+}): ResumeDecision {
+  const { state, fromBlock, toBlock, queryTag, filtered, logsPresent, logLines, cacheKey } = input
+  if (!state) return { action: 'resweep', truncateLogs: logsPresent, stampQuery: true }
+
+  // A cache fetched for a different filter answers a question we are not asking.
+  if (state.query !== undefined && state.query !== queryTag) {
+    return {
+      action: 'refuse',
+      reason:
+        `Cache ${cacheKey} was written for a different filter (${state.query}, now ${queryTag}).\n` +
+        `Its logs answer a question this run is not asking. Delete data/${cacheKey}-*.jsonl\n` +
+        'and its .state file to re-sweep, or pin the run to the block range that produced it.',
+    }
+  }
+
+  /**
+   * A legacy state carries no fingerprint, so its logs were fetched for an
+   * argument set we cannot check. Proceeding is allowed, but the fingerprint is
+   * NOT stamped afterwards: one stamped run would make unverified bytes
+   * indistinguishable from verified ones and silence the warning forever.
+   */
+  /**
+   * Only a RESUME on unverified content goes unstamped.
+   *
+   * A re-sweep discards whatever was there and fetches the range again under
+   * this run's filter, so its logs are this run's and stamping them is simply
+   * true. Suppressing the stamp there left a re-swept range permanently
+   * unfingerprinted — it would never be caught by the filter guard again, and
+   * the warning it kept emitting was about content that was no longer legacy.
+   * Observed on settle-USAT-1, re-swept and then written as found:0 with no
+   * query.
+   */
+  const unverified = state.query === undefined && filtered
+  const warn = unverified
+    ? `${cacheKey} predates filter fingerprinting; its logs were fetched for an argument ` +
+      'set this run cannot verify. Its state will not be stamped, so this keeps firing ' +
+      'until the range is swept from scratch.'
+    : undefined
+
+  let resumeAt: bigint
+  try {
+    resumeAt = BigInt(state.completedUpTo) + 1n
+  } catch {
+    return { action: 'resweep', truncateLogs: logsPresent, stampQuery: true, warn }
+  }
+
+  if (!(resumeAt > fromBlock && resumeAt <= toBlock + 1n)) {
+    // Declined: a pin below completedUpTo, or a range this cache does not cover.
+    // Its logs must go, or the fetch loop appends this run's onto them.
+    return { action: 'resweep', truncateLogs: logsPresent, stampQuery: true, warn }
+  }
+
+  /**
+   * A missing logs file means "found nothing" ONLY when the state says so.
+   * A legacy state has no `found`, so nothing proves the sweep ever ran — and
+   * deleting the .jsonl was the documented way to force a re-sweep. Reading
+   * that as zero turns a deliberate invalidation into a silent false answer.
+   */
+  if (!logsPresent && state.found !== 0) {
+    return {
+      action: 'resweep',
+      truncateLogs: false,
+      stampQuery: true,
+      warn:
+        `${cacheKey} has a state file and no logs file, and its state does not record how ` +
+        'many logs it found. That is not proof of an empty sweep, so the range is being ' +
+        'swept again from scratch.',
+    }
+  }
+
+  /**
+   * Only a SHORT file is a finding. The append precedes the state write, so a
+   * process killed between them leaves MORE lines than `found` — the overlap
+   * `dedupeLogs` exists to absorb. Treating that as truncation made a handled
+   * case fatal, on files up to 280 MB.
+   */
+  if (state.found !== undefined && logLines < state.found) {
+    return {
+      action: 'refuse',
+      reason:
+        `Cache ${cacheKey} recorded ${state.found} logs and its file holds only ${logLines}.\n` +
+        'Bytes that were counted are missing, so resuming would publish a truncated\n' +
+        `sweep as a complete one. Delete data/${cacheKey}-*.jsonl and its .state file.`,
+    }
+  }
+
+  return { action: 'resume', at: resumeAt, truncateLogs: false, stampQuery: !unverified, warn }
+}
+
+
+/**
  * (txHash, logIndex) uniquely identifies a log. Duplicates can only enter
  * through the resume cache — a crash landing between the data append and the
  * state write makes the next run re-fetch a wave it already stored. Rare, but
@@ -129,10 +343,55 @@ const replacer = (_k: string, v: unknown) =>
 const reviver = (_k: string, v: any) =>
   v && typeof v === 'object' && typeof v.__bigint === 'string' ? BigInt(v.__bigint) : v
 
-interface CacheState { completedUpTo: string }
+/**
+ * `query` fingerprints the filter the cached logs answer, not just the range.
+ *
+ * The key carried the token, a batch *index*, the start block and the
+ * endpoint — and not the addresses in the batch. `settle-USDC-0-58396729` is
+ * whatever two thousand reviewers happened to land in batch 0 on the run that
+ * wrote it. Add reviewers to the registry, re-run, and batch 0 holds a
+ * different set while reading the same file: the sweep then republishes the
+ * previous run's transfers as this run's answer, silently, and every
+ * payment-backed figure downstream is computed over the wrong population.
+ *
+ * Absent on caches written before this field existed. Those are readable, and
+ * a run that finds one says so rather than trusting it in silence.
+ */
+interface CacheState {
+  completedUpTo: string
+  query?: string
+  /**
+   * How many logs the completed portion of this sweep found.
+   *
+   * Present so that a sweep which found *nothing* can prove it did the work.
+   * Resuming required both the state file and the logs file to exist, and a
+   * batch that matched no transfers never created a logs file — so its state
+   * file, saying the whole range was swept, was ignored and the range was
+   * re-swept from scratch on every subsequent run. Two full-history passes in
+   * this registry are in that position, each about forty minutes, each
+   * correctly returning zero, repeated for as long as the caches live. The
+   * state file is the authority on how far; this field lets a missing logs
+   * file mean "found nothing" rather than "never ran", while still catching a
+   * logs file that was truncated or half-deleted underneath us.
+   */
+  found?: number
+}
+
+/**
+ * The endpoint is part of the cache key.
+ *
+ * The key was the block range alone, so a resume happily continued a scan
+ * another endpoint had started and republished its logs as this run's. That is
+ * not hypothetical here: this file documents forno answering 46, 40 and 37
+ * events over a range where the indexer answers 77, which is why the default
+ * moved. Mixing the two produces a log set no endpoint ever returned, and the
+ * coverage claim built on it counts records nobody can reproduce.
+ */
+const ENDPOINT_TAG = createHash('sha256').update(RPC_URL).digest('hex').slice(0, 8)
 
 function cachePaths(key: string) {
-  return { logs: `${CACHE_DIR}/${key}.jsonl`, state: `${CACHE_DIR}/${key}.state` }
+  const k = `${key}-${ENDPOINT_TAG}`
+  return { logs: `${CACHE_DIR}/${k}.jsonl`, state: `${CACHE_DIR}/${k}.state` }
 }
 
 /**
@@ -167,29 +426,75 @@ export async function getLogsChunked<T extends AbiEvent>(params: {
   let out: any[] = []
   let cursor = fromBlock
 
+  /**
+   * A stable digest of the filter arguments — the addresses, in the order the
+   * caller batched them. Sorting would hide a reordering that changes which
+   * addresses land in which batch, which is exactly what must not be hidden.
+   */
+  const queryTag = createHash('sha256')
+    .update(JSON.stringify(args ?? null, (_k, v) => (typeof v === 'bigint' ? v.toString() : v)))
+    .digest('hex')
+    .slice(0, 16)
+
   let paths: ReturnType<typeof cachePaths> | null = null
+  /**
+   * Whether this run resumed on content whose filter it could not verify.
+   * Decided by resumeDecision(); carried here only to gate the state stamp.
+   */
+  let stampQuery = true
   if (cacheKey) {
     mkdirSync(CACHE_DIR, { recursive: true })
     paths = cachePaths(cacheKey)
-    if (existsSync(paths.state) && existsSync(paths.logs)) {
+
+    let state: CacheState | null = null
+    if (existsSync(paths.state)) {
       try {
-        const state: CacheState = JSON.parse(readFileSync(paths.state, 'utf8'))
-        const resumeAt = BigInt(state.completedUpTo) + 1n
-        if (resumeAt > fromBlock && resumeAt <= toBlock + 1n) {
-          out = readFileSync(paths.logs, 'utf8')
-            .split('\n')
-            .filter(Boolean)
-            .map((line) => JSON.parse(line, reviver))
-          cursor = resumeAt
-          process.stdout.write(`  resuming ${cacheKey} at block ${cursor} (${out.length} cached)\n`)
-        }
+        state = JSON.parse(readFileSync(paths.state, 'utf8')) as CacheState
       } catch {
-        /* unreadable cache is simply ignored and refetched */
+        /* an unreadable state file is simply ignored and the range refetched */
       }
+    }
+
+    const logsPresent = existsSync(paths.logs)
+    let cached: any[] = []
+    if (logsPresent) {
+      try {
+        cached = readFileSync(paths.logs, 'utf8')
+          .split('\n')
+          .filter(Boolean)
+          .map((line) => JSON.parse(line, reviver))
+      } catch {
+        /* an unreadable logs file is treated as absent and refetched */
+      }
+    }
+
+    const decision = resumeDecision({
+      state,
+      fromBlock,
+      toBlock,
+      queryTag,
+      filtered: args !== undefined,
+      logsPresent,
+      logLines: cached.length,
+      cacheKey,
+    })
+
+    if (decision.action === 'refuse') throw new Error(decision.reason)
+    if (decision.warn) console.warn(`\n  ! ${decision.warn}`)
+    stampQuery = decision.stampQuery
+
+    if (decision.action === 'resume') {
+      out = cached
+      cursor = decision.at
+      process.stdout.write(`  resuming ${cacheKey} at block ${cursor} (${out.length} cached)\n`)
+    } else if (decision.truncateLogs) {
+      // Not resuming from this file, so it must not survive: the fetch loop
+      // appends, and a stale file would merge a previous sweep into this one.
+      writeFileSync(paths.logs, '')
     }
   }
 
-  // Permanent: only a range rejection lowers this.
+  // Permanent: only a range rejection or a capped response lowers this.
   let ceiling = LOG_CHUNK_SIZE
   // Current attempt: may dip below the ceiling for a dense stretch, then recover.
   let span = LOG_CHUNK_SIZE
@@ -217,6 +522,44 @@ export async function getLogsChunked<T extends AbiEvent>(params: {
         ),
       )
 
+      /**
+       * A response at the cap is a truncated response, not a full one.
+       *
+       * Measured on 2026-08-30: celo.blockscout.com/api/eth-rpc returns at most
+       * 1,000 logs and says nothing about it — 100,000 blocks and 400,000
+       * blocks both come back with exactly 1,000. forno and Ankr reject a
+       * range they cannot serve, which is an honest answer; this endpoint
+       * gives a plausible one instead.
+       *
+       * The audit is under that today: the densest 5,000-block window of
+       * NewFeedback holds 471 events. But that is a factor of two, and the
+       * registry is growing. A silent truncation here does not produce an
+       * error or a gap — it produces a smaller census, a different Merkle
+       * root, and a coverage claim that counts records nobody can reproduce.
+       *
+       * So a wave that comes back at the cap is not believed: the span is
+       * halved and the wave re-asked, until either the responses drop below
+       * the cap or the span reaches one block, which fails loudly.
+       */
+      const suspect = waves.findIndex((w) => w.length >= TRUNCATION_SUSPECT)
+      if (suspect !== -1) {
+        if (span <= 1n) {
+          throw new Error(
+            `The endpoint returned ${waves[suspect]!.length} logs for a single block ` +
+            `(${ranges[suspect]!.from}). That is at or above the response cap, so the ` +
+            'answer is truncated and cannot be narrowed further. Use an endpoint that ' +
+            'rejects oversized ranges instead of silently capping them.',
+          )
+        }
+        ceiling = span / 2n
+        span = ceiling
+        console.log(
+          `\n  response at the cap (${waves[suspect]!.length} logs) — narrowing to ` +
+          `${span}-block chunks and re-asking. A capped response is a truncated one.`,
+        )
+        continue
+      }
+
       const fresh = waves.flat()
       out.push(...fresh)
       const waveEnd = ranges[ranges.length - 1]!.to
@@ -228,7 +571,14 @@ export async function getLogsChunked<T extends AbiEvent>(params: {
             fresh.map((l) => JSON.stringify(l, replacer)).join('\n') + '\n',
           )
         }
-        writeFileSync(paths.state, JSON.stringify({ completedUpTo: waveEnd.toString() }))
+        writeFileSync(
+          paths.state,
+          JSON.stringify({
+            completedUpTo: waveEnd.toString(),
+            ...(stampQuery ? { query: queryTag } : {}),
+            found: out.length,
+          }),
+        )
       }
 
       cursor = waveEnd + 1n
@@ -343,4 +693,58 @@ export async function blockTimestamps(blocks: bigint[]): Promise<Map<bigint, num
     process.stdout.write('\n')
   }
   return tsCache
+}
+
+/**
+ * Does this endpoint actually apply the topic filters it is given?
+ *
+ * Measured on 2026-08-30: celo.blockscout.com/api/eth-rpc honours a filter on
+ * the FIRST indexed argument and silently ignores the second. Asked for
+ * Transfer logs with `to` set to an address that demonstrably appears in the
+ * window, it returns zero — no error, no warning, an empty array that reads
+ * exactly like "this address received nothing". forno and Ankr both answer
+ * correctly on the same query in the same window.
+ *
+ * Nothing in this audit filters on `to` today, so nothing is wrong in what has
+ * been published. But the settlement sweep is one obvious optimisation away
+ * from it — filtering on the 565 agent owners instead of the 4,252 reviewers
+ * is seven times cheaper, and on this endpoint it would have produced a clean,
+ * plausible, entirely fabricated zero. This function exists so that the next
+ * person to have that idea is stopped by a failing check rather than by
+ * publishing it.
+ *
+ * @returns the indexed positions this endpoint honours, 1-based.
+ */
+export async function probeTopicFiltering(params: {
+  address: Address
+  event: AbiEvent
+  fromBlock: bigint
+  toBlock: bigint
+  /** Names of the indexed arguments to probe, in order. */
+  indexed: string[]
+}): Promise<{ honoured: string[]; ignored: string[] }> {
+  const ask = (args?: Record<string, unknown>) =>
+    throughRateLimit('topic-probe', () =>
+      client.getLogs({
+        address: params.address,
+        event: params.event,
+        fromBlock: params.fromBlock,
+        toBlock: params.toBlock,
+        ...(args ? { args } : {}),
+      } as any),
+    )
+
+  const all = await ask()
+  if (!all.length) return { honoured: [], ignored: [] }
+  const sample = (all[0] as any).args as Record<string, unknown>
+
+  const honoured: string[] = []
+  const ignored: string[] = []
+  for (const name of params.indexed) {
+    const value = sample[name]
+    if (value === undefined) continue
+    const got = await ask({ [name]: value })
+    ;(got.length > 0 ? honoured : ignored).push(name)
+  }
+  return { honoured, ignored }
 }

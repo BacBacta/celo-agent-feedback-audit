@@ -1,7 +1,18 @@
 node_modules/
 data/
-out/
+out/*
+# …except the evidence corpus, which is the audit's own proof.
+#
+# It was excluded when it was 152 MB. It is 5.6 MB now — 2.4 MB of documents,
+# 3.1 MB of manifest, 0.2 MB describing the bodies that were not documents —
+# because 98.4% of the old size was block-explorer HTML served where a
+# feedbackURI pointed at an address page instead of a file, and those are now
+# recorded rather than stored whole. A verdict whose proof lives only on an
+# ephemeral container is the thing this repository objects to.
+!out/evidence-corpus/
+!out/evidence-corpus/**
 dist/
 .env
 *.log
 data-bs/
+out-*/

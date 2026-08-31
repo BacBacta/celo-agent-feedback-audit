@@ -1,0 +1,19 @@
+{
+  "type": "https://eips.ethereum.org/EIPS/eip-8004#feedback-v1",
+  "agentId": 9219,
+  "rating": 100,
+  "tag": "starred",
+  "tags": [
+    "accurate"
+  ],
+  "tagLabels": [
+    "Accurate"
+  ],
+  "comment": "Onfra AI chat feedback: Accurate.",
+  "reviewer": "0x1C059486B99d6A2D9372827b70084fbfD014E978",
+  "servicesUsed": [
+    "chat_query"
+  ],
+  "platform": "https://wallet-profile-orpin.vercel.app",
+  "reviewedAt": "2026-07-22"
+}

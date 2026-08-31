@@ -1,0 +1,19 @@
+{
+  "type": "https://eips.ethereum.org/EIPS/eip-8004#feedback-v1",
+  "agentId": 9219,
+  "rating": 92,
+  "tag": "starred",
+  "tags": [
+    "insightful"
+  ],
+  "tagLabels": [
+    "Great insights"
+  ],
+  "comment": "Wallet Analyst AI chat feedback: Great insights.",
+  "reviewer": "0xB10F1c8Df7b25ceEeDb5244f8bbef99a5AF1200d",
+  "servicesUsed": [
+    "chat_query"
+  ],
+  "platform": "https://wallet-profile-orpin.vercel.app",
+  "reviewedAt": "2026-06-12"
+}

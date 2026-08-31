@@ -8,13 +8,18 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && cp src/*.mjs dist/",
     "audit": "npm run build && node --env-file-if-exists=.env dist/main.js",
     "audit:dev": "tsx --env-file-if-exists=.env src/main.ts",
     "test": "tsx test/analysis.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "counter-checks": "node counter-checks.mjs",
+    "crosscheck": "node crosscheck.mjs",
+    "verify-parties": "node verify-parties.mjs",
+    "publish-report": "node publish-report.mjs"
   },
   "dependencies": {
+    "undici": "^8.10.0",
     "viem": "^2.21.0"
   },
   "devDependencies": {
