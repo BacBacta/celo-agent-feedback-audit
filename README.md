@@ -107,6 +107,32 @@ attestation ledger is written from),
 [`.sweep.json`](docs/audit-58396729-76199590-r8-ssrf-cid-datauri-c938a5c3008b50a2.sweep.json)
 (the coverage manifest `commitSweep` publishes).
 
+**These verdicts are now on chain.** 10,469 of those 20,097 rows were written to
+[`0x86931Ae7…78a7`](https://celo.blockscout.com/address/0x86931Ae74F5cE9AA8bf818808e47102516CE78a7)
+on 31 August 2026, followed by the coverage claim in
+[one transaction](https://celo.blockscout.com/tx/0xff627c82a7d1ac793b7fed198966634cebd6ebd5d6189acc5baf4bb35e02ad00)
+carrying `observed 27520`, `attested 10469` and the manifest's root.
+
+The gap between those two figures is the point rather than an omission to
+notice later. 9,628 rows were deliberately not written: every one of them is
+`EvidenceAbsent`, which is a bijection with a predicate over the registry event
+itself — `feedbackURI == "" && feedbackHash != 0`, 9,628 of 9,628 in both
+directions — so a reader reconstructs the entire set from the registry with no
+attester input at all. Writing them was measured at 622,994,080 gas, 50.25% of
+the full backfill, to publish what anyone can already derive.
+
+Those 9,628 records — and the 7,423 in range that declare neither a URI nor a
+hash, and so never reached the export — therefore read `None` on chain, which
+the contract's own documentation calls the attester saying nothing about a
+record it says it looked at. The sweep is what keeps that honest: it publishes
+what the indexer *saw* beside what the attester *wrote*, so the silence is
+measurable rather than invisible.
+
+Cost, verification and the one interruption are recorded in
+[`deployments/backfill-celo.json`](https://github.com/BacBacta/provenance-attestations)
+in the attestation repository, including the 24 records read back from the
+contract and compared field by field against the `.evidence.csv` above.
+
 Completed runs are snapshotted under [`docs/`](docs/) as
 `audit-<fromBlock>-<toBlock>-<rules>-<fingerprint>.md`, with the
 machine-readable result beside it.
@@ -301,6 +327,7 @@ Verified live on Celo mainnet (chainId 42220) on 2026-08-25:
 | ERC-8004 Identity Registry | [`0x8004A169…a432`](https://celo.blockscout.com/address/0x8004A169FB4a3325136EB29fA0ceB6D2e539a432) |
 | Self Agent ID Registry | [`0xaC3DF9AB…5944`](https://celo.blockscout.com/address/0xaC3DF9ABf80d0F5c020C06B04Cced27763355944) |
 | x402 facilitator signer | [`0x0d74D5Ce…FB48`](https://celo.blockscout.com/address/0x0d74D5Cefd2e7F24E623330ebE3d8D4cB45fFB48) |
+| Provenance attestations (this audit's verdicts, v5.0.0) | [`0x86931Ae7…78a7`](https://celo.blockscout.com/address/0x86931Ae74F5cE9AA8bf818808e47102516CE78a7) |
 | USDC / USDT / USAT | settlement assets, all EIP-3009 |
 
 ## Limits
