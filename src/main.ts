@@ -23,40 +23,37 @@ import { escapeCell as csvEsc } from './csv.mjs'
 import { recordKey, merkleRoot } from './coverage.mjs'
 import { concentration, findBursts } from './analysis/concentration.js'
 import { reconcile, summarize } from './analysis/reconcile.js'
+import { resolveRange } from './range.js'
 import { renderMarkdown, renderJSON, collectEvidence, rung, evidenceRung, type AuditResult } from './report.js'
 
 const iso = (ts: number) => (ts ? new Date(ts * 1000).toISOString().slice(0, 10) : 'unknown')
 
 async function main() {
-  const window = process.env.AUDIT_WINDOW ?? 'all'
   const maxFetches = Number(process.env.MAX_FILE_FETCHES ?? 2000)
 
   const head = await latestBlock()
-  const fromBlock =
-    window === 'all' ? REGISTRY_DEPLOY_BLOCK : head - BigInt(Number(window)) * BLOCKS_PER_DAY
   /**
-   * A published report has to name a range somebody else can re-run.
-   *
-   * `toBlock` was always the chain head, so every regeneration covered a
-   * different span — Celo produces a block a second — and "every figure is
-   * reproducible: npm run audit" was true of the command and false of the
-   * result. Nobody could reproduce THIS report, only a later one that happened
-   * to disagree slightly.
-   *
-   * AUDIT_TO_BLOCK pins it. The report prints the value to use, so a reader
-   * gets the exact range back rather than an approximation of it.
+   * The range decision lives in range.ts, as a pure function tested without a
+   * chain. It is the one setting that changes which records exist rather than
+   * how carefully each is checked, so a report that gets it wrong is internally
+   * consistent, names a range in its own filename, and is wrong about the
+   * world.
    */
-  const pinned = (process.env.AUDIT_TO_BLOCK ?? '').trim()
-  if (pinned && !/^\d+$/.test(pinned)) {
-    console.error(`AUDIT_TO_BLOCK must be a block number; got ${JSON.stringify(pinned)}.`)
+  const range = resolveRange({
+    window: process.env.AUDIT_WINDOW,
+    from: process.env.AUDIT_FROM_BLOCK,
+    to: process.env.AUDIT_TO_BLOCK,
+    head,
+    deployBlock: REGISTRY_DEPLOY_BLOCK,
+    blocksPerDay: BLOCKS_PER_DAY,
+  })
+  if (!range.ok) {
+    for (const line of range.lines) console.error(line)
     process.exit(1)
   }
-  if (pinned && BigInt(pinned) > head) {
-    console.error(`AUDIT_TO_BLOCK=${pinned} is beyond the chain head (${head}).`)
-    process.exit(1)
-  }
-  const toBlock = pinned ? BigInt(pinned) : head
-  if (pinned) console.log(`  pinned to block ${toBlock} (AUDIT_TO_BLOCK)`)
+  const { fromBlock, toBlock } = range
+  if (range.pinnedTo) console.log(`  pinned to block ${toBlock} (AUDIT_TO_BLOCK)`)
+  if (range.pinnedFrom) console.log(`  starting at block ${fromBlock} (AUDIT_FROM_BLOCK)`)
 
   console.log(`Celo Agent Feedback Audit v${AUDIT_VERSION}`)
   console.log(`  blocks ${fromBlock} → ${toBlock}\n`)

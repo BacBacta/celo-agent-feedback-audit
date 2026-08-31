@@ -94,7 +94,30 @@ npm run typecheck
 
 ## Published runs
 
-**Latest:** [blocks 58,396,729–76,199,590](docs/audit-58396729-76199590-r8-ssrf-cid-datauri-c938a5c3008b50a2.md)
+**Latest:** [blocks 76,199,591–76,273,643](docs/audit-76199591-76273643-r8-ssrf-cid-datauri-c938a5c3008b50a2.md)
+— the first incremental sweep, picking up exactly where the census below ended.
+18 feedback records over about four days, 17 of them declaring a file.
+
+Every one of those 17 files was retrieved and every hash matched the registry's
+`feedbackHash` — the documentary chain is intact end to end. Every one of them
+also declares a payment, names Celo as the chain, and names a transaction that
+**does not exist there**. Checked against three independent endpoints (forno,
+Blockscout, Ankr), each of which answered a control lookup correctly first,
+because "not found" from a single node is a fact about that node.
+
+All 17 come from one reviewer, `0x10304054…13C7`, rating seven different agents.
+The same address accounts for **all 76** `PaymentTxNotFound` records in the
+full-history census below, plus 17 `PaymentPartyMismatch` — 93 of its 93
+published records, and now 17 more.
+
+The verdict says only what was observed: the transaction named in the file is
+not on the chain the file names. It asserts nothing about intent, and there are
+innocent readings — a client that writes the hash before broadcasting, or one
+misreporting which chain it settled on. What the ladder does establish is that
+the evidence being perfectly well-formed says nothing at all about whether the
+payment happened, which is the gap this audit exists to measure.
+
+**Full-history census:** [blocks 58,396,729–76,199,590](docs/audit-58396729-76199590-r8-ssrf-cid-datauri-c938a5c3008b50a2.md)
 — 27,520 feedback records, February to August 2026, every declared evidence file
 opened. Published with the rows it was found from:
 [`.json`](docs/audit-58396729-76199590-r8-ssrf-cid-datauri-c938a5c3008b50a2.json) (the same

@@ -15,6 +15,7 @@ import { collectEvidence, renderMarkdown } from '../src/report.js'
 import { pool } from '../src/pool.js'
 import type { FeedbackRecord } from '../src/sources/feedback.js'
 import type { Settlement } from '../src/sources/settlements.js'
+import { resolveRange } from '../src/range.js'
 
 let passed = 0
 /**
@@ -1903,5 +1904,119 @@ await check('malformed JSON is still a candidate document and is kept', async ()
   assert.equal(a.put(enc.encode('not json at all'), meta).stored, false)
   assert.equal(readdirSync(join(dir, 'blobs')).length, 3)
 })
+
+
+// ---------------------------------------------------------------------------
+// resolveRange — the one setting that changes WHICH records exist
+// ---------------------------------------------------------------------------
+
+{
+  const HEAD = 76_273_207n
+  const DEPLOY = 58_396_729n
+  const PER_DAY = 17_280n
+  const r = (o: Partial<Parameters<typeof resolveRange>[0]> = {}) =>
+    resolveRange({ head: HEAD, deployBlock: DEPLOY, blocksPerDay: PER_DAY, ...o })
+
+  check('nothing set sweeps the whole registry to the head', () => {
+    const g = r()
+    assert.ok(g.ok)
+    assert.equal(g.fromBlock, DEPLOY)
+    assert.equal(g.toBlock, HEAD)
+    assert.equal(g.pinnedFrom, false)
+    assert.equal(g.pinnedTo, false)
+  })
+
+  check('an exact from-block is what a second sweep needs', () => {
+    // AUDIT_WINDOW counts days back from the end and cannot name a block. The
+    // attestation contract refuses a claim starting more than one block past
+    // the frontier it covers, so "days" is not expressible there.
+    const g = r({ from: '76199591', to: '76273107' })
+    assert.ok(g.ok)
+    assert.equal(g.fromBlock, 76_199_591n)
+    assert.equal(g.toBlock, 76_273_107n)
+    assert.equal(g.pinnedFrom, true)
+    assert.equal(g.pinnedTo, true)
+  })
+
+  check('a window is measured back from the END, not from the head', () => {
+    // The regression this function was extracted for. `head - window` is the
+    // same as `toBlock - window` only when the end IS the head.
+    const g = r({ window: '7', to: '76000000' })
+    assert.ok(g.ok)
+    assert.equal(g.toBlock, 76_000_000n)
+    assert.equal(g.fromBlock, 76_000_000n - 7n * PER_DAY)
+  })
+
+  check('a pinned end older than the window is refused, not silently inverted', () => {
+    // Under `head - window` this produced fromBlock > toBlock: no logs, and a
+    // report that reads as a quiet window rather than as a contradiction.
+    const inverted = resolveRange({
+      head: HEAD, deployBlock: DEPLOY, blocksPerDay: PER_DAY,
+      window: '1', to: String(HEAD - 10n * PER_DAY),
+    })
+    assert.ok(inverted.ok, 'anchored to the end, this is a perfectly ordinary range')
+    assert.equal(inverted.fromBlock, HEAD - 10n * PER_DAY - PER_DAY)
+    // And the guard still catches a genuinely inverted request.
+    const bad = r({ from: '76273200', to: '76000000' })
+    assert.ok(!bad.ok)
+    assert.ok(bad.lines.join(' ').includes('starts after it ends'), bad.lines.join(' '))
+  })
+
+  check('a window wider than the chain clamps to the registry, never underflows', () => {
+    const g = r({ window: '100000' })
+    assert.ok(g.ok)
+    assert.equal(g.fromBlock, DEPLOY, 'BigInt would happily produce a negative block')
+  })
+
+  check('both ways of naming a start is refused rather than resolved by precedence', () => {
+    const g = r({ from: '76199591', window: '7' })
+    assert.ok(!g.ok)
+    const t = g.lines.join(' ')
+    assert.ok(t.includes('both say where to start'), t)
+    assert.ok(t.includes('76199591') && t.includes('7'), t)
+  })
+
+  check("an explicit AUDIT_WINDOW='all' beside a from-block is still a conflict", () => {
+    // 'all' is the default when unset, but setting it explicitly is a choice,
+    // and honouring the from-block silently would be the precedence rule this
+    // refuses to have.
+    assert.ok(!r({ from: '76199591', window: 'all' }).ok)
+    assert.ok(r({ from: '76199591' }).ok, 'unset is not the same as set to all')
+  })
+
+  check('a start before the registry existed is refused', () => {
+    const g = r({ from: String(DEPLOY - 1n) })
+    assert.ok(!g.ok)
+    assert.ok(g.lines.join(' ').includes('before the registry existed'))
+  })
+
+  check('an end beyond the head is refused', () => {
+    const g = r({ to: String(HEAD + 1n) })
+    assert.ok(!g.ok)
+    assert.ok(g.lines.join(' ').includes('beyond the chain head'))
+  })
+
+  check('values that are not block numbers are named, not coerced', () => {
+    for (const bad of ['76_199_591', '0x1234', 'head', '-5', '1e6', ' ']) {
+      const f = r({ from: bad })
+      const t = r({ to: bad })
+      if (bad.trim() === '') {
+        assert.ok(f.ok, 'blank is unset, not invalid')
+        continue
+      }
+      assert.ok(!f.ok, `AUDIT_FROM_BLOCK=${bad} should be refused`)
+      assert.ok(!t.ok, `AUDIT_TO_BLOCK=${bad} should be refused`)
+    }
+    const w = r({ window: 'seven' })
+    assert.ok(!w.ok)
+    assert.ok(w.lines.join(' ').includes("'all' or a number of days"))
+  })
+
+  check('a single-block range is legal', () => {
+    const g = r({ from: '76199591', to: '76199591' })
+    assert.ok(g.ok)
+    assert.equal(g.fromBlock, g.toBlock)
+  })
+}
 
 console.log(`\n${passed} passed (full suite)\n`)
