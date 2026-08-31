@@ -71,9 +71,27 @@ async function main() {
     toBlock,
   })
   const feedback = await loadFeedback(fromBlock, toBlock)
+  /**
+   * A window that held nothing is a result, not a reason to stop.
+   *
+   * This used to return here, writing no manifest and leaving out/ holding the
+   * previous run — which the sweep then republished and very nearly attested as
+   * new work. Worse than the stale files: a range with no records could not be
+   * claimed at all, so the coverage frontier stalled through every quiet period,
+   * and a reader could no longer tell "nothing happened here" from "the attester
+   * stopped". That distinction is the entire purpose of publishing coverage.
+   *
+   * `commitSweep` accepts `observed 0, attested 0` with a zero root — checked
+   * against the deployed bytecode — and the claim is exactly as falsifiable as
+   * any other: re-index the range, and finding a single record refutes it.
+   *
+   * So the run continues with an empty set. Everything downstream is a count or
+   * a proportion of zero, and the report's own NaN guards refuse to render a
+   * figure that came out undefined, so an empty run either produces an honest
+   * report of nothing or refuses loudly.
+   */
   if (feedback.length === 0) {
-    console.log('\nNo feedback records in this window. Widen AUDIT_WINDOW and re-run.')
-    return
+    console.log('\n  no feedback records in this range — publishing a claim of nothing')
   }
 
   /**
